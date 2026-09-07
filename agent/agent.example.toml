@@ -1,0 +1,30 @@
+# confidant-agent example config (tracked in git; contains NO secrets).
+# Copy to ~/.config/confidant/agent.toml and adjust. See docs/local-agent.md §3.
+#
+# NOTE: TOML loading is a TODO in the Phase-1 skeleton — the binary currently
+# reads the equivalent settings from environment variables / flags. This file
+# documents the intended shape.
+
+[broker]
+endpoint        = "https://broker.confidant.internal:8443"
+client_cert     = "~/.config/confidant/agent.pem"   # device identity (mTLS)
+server_spki_pin = "sha256/REPLACE_WITH_BROKER_SPKI_PIN"
+
+[proxy]
+listen = "127.0.0.1:8317"
+# Hosts to MITM + route through the broker. Everything else is blind-tunnelled.
+intercept = ["api.openai.com", "*.amazonaws.com", "api.github.com"]
+
+[refs]
+# Inert refs the tools are configured with -> secret ids the broker resolves.
+"cfdt:openai/personal" = "openai/personal"
+"cfdt:aws/dev"         = "aws/dev"
+
+[detect]
+# How the agent finds the ref in an outbound request, per host.
+"api.openai.com"  = { location = "header", name = "authorization", strip_prefix = "Bearer " }
+"api.github.com"  = { location = "header", name = "authorization", strip_prefix = "Bearer " }
+# The sentinel is the DUMMY AWS access-key-id you configure the SDK with. It must
+# be slash-free (SigV4 uses "/" as the Credential= delimiter); `ref` is the cfdt:
+# reference it maps to, since AWS carries no ref verbatim in the request.
+"*.amazonaws.com" = { mode = "aws-sdk-dummy", sentinel_access_key_id = "AKIACONFIDANTDEV", ref = "cfdt:aws/dev" }
