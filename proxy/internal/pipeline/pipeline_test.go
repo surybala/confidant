@@ -24,7 +24,11 @@ const testSecret = "sk-REAL-SECRET-VALUE"
 
 func sealedRecord(t *testing.T, kek *kms.DevKEK, id string, pol policy.Policy) *store.Record {
 	t.Helper()
-	env, err := kek.Seal([]byte(testSecret))
+	aad, err := store.EnvelopeAADFor(id, kms.AlgDevGCM, "", pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := kek.Seal([]byte(testSecret), aad)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,9 +114,9 @@ type spyUnwrap struct {
 	called int32
 }
 
-func (s *spyUnwrap) Unwrap(ctx context.Context, env kms.Envelope) ([]byte, error) {
+func (s *spyUnwrap) Unwrap(ctx context.Context, env kms.Envelope, aad []byte) ([]byte, error) {
 	atomic.AddInt32(&s.called, 1)
-	return s.inner.Unwrap(ctx, env)
+	return s.inner.Unwrap(ctx, env, aad)
 }
 
 // TestAuthorizeBeforeUnwrap validates I-B5: a policy denial happens before any
@@ -140,6 +144,41 @@ func TestAuthorizeBeforeUnwrap(t *testing.T) {
 	}
 	if recs := aud.Snapshot(); len(recs) != 1 || recs[0].Decision != "denied" {
 		t.Errorf("expected 1 denied audit, got %+v", recs)
+	}
+}
+
+func TestPolicyTamperFailsAtAuthenticatedUnwrap(t *testing.T) {
+	var upstreamCalled int32
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&upstreamCalled, 1)
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	kek, _, _ := kms.GenerateDevKEK()
+	host := hostOfT(t, upstream.URL)
+	originalPolicy := staticPolicy([]string{"original-only.example"}, []string{"GET"})
+	rec := sealedRecord(t, kek, "openai/personal", originalPolicy)
+	// Simulate mutable-store tampering: broaden the readable policy after sealing.
+	rec.Policy = staticPolicy([]string{host}, []string{"GET"})
+	st := store.NewMemStore()
+	st.Put(rec)
+
+	aud := &audit.MemAuditor{}
+	h := New(Deps{Store: st, Unwrapper: kek, Audit: aud, Egress: []string{host}, Upstream: upstream.Client()})
+	rr := doProxy(t, h, wire.Request{
+		Ref:      "cfdt:openai/personal",
+		Upstream: wire.Upstream{Method: "GET", URL: upstream.URL},
+	})
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
+	}
+	if atomic.LoadInt32(&upstreamCalled) != 0 {
+		t.Fatal("upstream was called after policy tampering")
+	}
+	if recs := aud.Snapshot(); len(recs) != 1 || recs[0].Decision != "denied" {
+		t.Errorf("expected 1 denied audit after tamper, got %+v", recs)
 	}
 }
 
@@ -227,7 +266,7 @@ func TestUnknownRef(t *testing.T) {
 // errUnwrap always fails, simulating a KMS/attestation failure.
 type errUnwrap struct{}
 
-func (errUnwrap) Unwrap(context.Context, kms.Envelope) ([]byte, error) {
+func (errUnwrap) Unwrap(context.Context, kms.Envelope, []byte) ([]byte, error) {
 	return nil, context.DeadlineExceeded
 }
 

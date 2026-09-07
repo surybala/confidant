@@ -28,6 +28,15 @@ type Record struct {
 	Policy   policy.Policy `json:"policy"`
 }
 
+type envelopeAAD struct {
+	Purpose    string        `json:"purpose"`
+	Version    int           `json:"version"`
+	ID         string        `json:"id"`
+	Alg        string        `json:"alg"`
+	KMSKeyName string        `json:"kms_key,omitempty"`
+	Policy     policy.Policy `json:"policy"`
+}
+
 // Store resolves a secret id to its record.
 type Store interface {
 	Get(id string) (*Record, error)
@@ -61,6 +70,30 @@ func (m *MemStore) Get(id string) (*Record, error) {
 		return nil, ErrNotFound
 	}
 	return r, nil
+}
+
+// EnvelopeAAD returns the canonical associated data for an existing record.
+// AES-GCM authenticates this data even though it remains plaintext in the store,
+// so changing the record id, policy, algorithm, or KMS key makes unwrap fail.
+func EnvelopeAAD(id string, env kms.Envelope, pol policy.Policy) ([]byte, error) {
+	return EnvelopeAADFor(id, env.Alg, env.KMSKeyName, pol)
+}
+
+// EnvelopeAADFor returns the associated data used at enrollment time before the
+// Envelope exists. Keep this schema versioned and append-only.
+func EnvelopeAADFor(id, alg, kmsKeyName string, pol policy.Policy) ([]byte, error) {
+	b, err := json.Marshal(envelopeAAD{
+		Purpose:    "confidant.secret-envelope",
+		Version:    kms.EnvelopeAADVersion,
+		ID:         id,
+		Alg:        alg,
+		KMSKeyName: kmsKeyName,
+		Policy:     pol,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal envelope AAD: %w", err)
+	}
+	return b, nil
 }
 
 // All returns a snapshot of all records (for persistence).

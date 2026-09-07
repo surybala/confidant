@@ -15,14 +15,15 @@ func TestSealUnwrapRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	plain := []byte("sk-secret-value")
-	env, err := kek.Seal(plain)
+	aad := []byte("record=openai/personal")
+	env, err := kek.Seal(plain, aad)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(env.Ciphertext, plain) {
 		t.Error("ciphertext contains plaintext")
 	}
-	got, err := kek.Unwrap(context.Background(), env)
+	got, err := kek.Unwrap(context.Background(), env, aad)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,18 +34,35 @@ func TestSealUnwrapRoundTrip(t *testing.T) {
 
 func TestUnwrapTamperFails(t *testing.T) {
 	kek, _, _ := GenerateDevKEK()
-	env, _ := kek.Seal([]byte("secret"))
+	env, _ := kek.Seal([]byte("secret"), []byte("aad"))
 	env.Ciphertext[0] ^= 0xff // tamper
-	if _, err := kek.Unwrap(context.Background(), env); err == nil {
+	if _, err := kek.Unwrap(context.Background(), env, []byte("aad")); err == nil {
 		t.Error("expected auth failure on tampered ciphertext")
+	}
+}
+
+func TestUnwrapAADTamperFails(t *testing.T) {
+	kek, _, _ := GenerateDevKEK()
+	env, _ := kek.Seal([]byte("secret"), []byte("record=openai/personal"))
+	if _, err := kek.Unwrap(context.Background(), env, []byte("record=other")); err == nil {
+		t.Error("expected auth failure when associated data changes")
+	}
+}
+
+func TestUnwrapRejectsLegacyEnvelopeWithoutAADVersion(t *testing.T) {
+	kek, _, _ := GenerateDevKEK()
+	env, _ := kek.Seal([]byte("secret"), []byte("aad"))
+	env.AADVersion = 0
+	if _, err := kek.Unwrap(context.Background(), env, []byte("aad")); err == nil {
+		t.Error("expected error for legacy envelope without AAD version")
 	}
 }
 
 func TestUnwrapWrongAlg(t *testing.T) {
 	kek, _, _ := GenerateDevKEK()
-	env, _ := kek.Seal([]byte("secret"))
+	env, _ := kek.Seal([]byte("secret"), []byte("aad"))
 	env.Alg = "bogus"
-	if _, err := kek.Unwrap(context.Background(), env); err == nil {
+	if _, err := kek.Unwrap(context.Background(), env, []byte("aad")); err == nil {
 		t.Error("expected error for unknown alg")
 	}
 }
@@ -59,8 +77,8 @@ func TestKEKSaveLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, _ := kek.Seal([]byte("x"))
-	if _, err := loaded.Unwrap(context.Background(), env); err != nil {
+	env, _ := kek.Seal([]byte("x"), []byte("aad"))
+	if _, err := loaded.Unwrap(context.Background(), env, []byte("aad")); err != nil {
 		t.Errorf("loaded KEK could not unwrap: %v", err)
 	}
 }

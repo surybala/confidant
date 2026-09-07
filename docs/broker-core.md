@@ -11,6 +11,19 @@ attaches it to the outbound call, scrubs the response, and audits the operation.
 If a single sentence has to survive: **the broker fails closed, injection authority
 lives only in stored policy, and no secret ever leaves the enclave in any form.**
 
+> **Implementation status (2026-09-07).** The `/v1/proxy` pipeline, both the local
+> **dev** unwrapper (dev KEK) and the **enclave** unwrapper (attestation-gated Cloud
+> KMS + Workload Identity Federation, behind a cloud-provider abstraction with GCP
+> as the default), enrollment sealing for both with versioned AEAD associated-data
+> binding, mTLS, egress allowlist, response
+> scrubbing, and the hash-chained audit are **implemented and tested**. `CONFIDANT_MODE=enclave`
+> now runs. Two design points diverge from or lag this spec and are noted inline:
+> the tailnet listener uses a **userspace `tailscaled` + `tailscale serve`** sidecar
+> in the enclave container rather than embedded `tsnet` (§2/§4), and the tailnet
+> auth key is currently passed as enclave metadata rather than being
+> **attestation-gated** (I-B15, §11). Plaintext secret caching, SigV4/OAuth2
+> modules, and a GCS-backed store remain unimplemented and fail closed.
+
 ---
 
 ## 1 · Responsibilities
@@ -42,6 +55,7 @@ code, offloading arbitrary computation, multi-tenant isolation. See parent spec 
 
 **Secret handling**
 - Plaintext secrets and DEKs exist only inside the enclave process. Mutable buffers are wiped as soon as practical after use, but the Go prototype cannot honestly promise that a credential never enters a `string`: static header/query injection and the TLS/runtime stack create transient in-enclave copies.
+- Envelope ciphertext is authenticated against versioned associated data derived from the record id, algorithm, KMS key resource, and stored spend policy. The broker can still authorize before unwrap because policy remains plaintext, but policy/id/key tampering fails closed at decrypt time.
 - **No plaintext static/signed secret cache in the current Go prototype.** Add caching only behind an explicit cache object with TTL, eviction, and best-effort wipe semantics. OAuth access tokens may later be held to their real expiry because they are operational state, not long-lived enrollment secrets.
 - Secrets, DEKs, KEK handles, refresh/access tokens **never** appear in logs, audit records, metrics, error messages, stack traces, or responses. This is enforced by a redaction layer and by avoiding secret-bearing fields in observability records.
 - **Authorize before unwrap.** Policy authorization completes before KMS is ever called; a denied request never triggers a decrypt. (Invariant I-B5.)
@@ -52,9 +66,9 @@ code, offloading arbitrary computation, multi-tenant isolation. See parent spec 
 - **Upstream TLS is verified** (real CA chain). High-value secrets may additionally **pin** the upstream cert/SPKI in policy.
 
 **Private connectivity (no public ingress)**
-- The `/v1/proxy` listener is bound only to the **Tailscale tailnet** via embedded **`tsnet`** (userspace WireGuard — no TUN device, no privileged daemon, so it fits the non-interactive Confidential Space enclave). The broker has **no public-internet-facing listener** (invariant I-B13).
+- The `/v1/proxy` listener is reachable only over the **Tailscale tailnet**, never a public interface (invariant I-B13). *Implemented approach:* the broker binds a **loopback** listener (`127.0.0.1`), and a **userspace `tailscaled`** (`--tun=userspace-networking`, which fits the non-interactive Confidential Space enclave with no TUN device or privileged daemon) forwards inbound tailnet TCP to it via `tailscale serve`, preserving the broker's own mTLS end to end. Enclave config validation refuses a wildcard bind (`0.0.0.0`/`::`) so the broker can never be exposed on a public interface. Embedding **`tsnet`** directly is the originally-specced alternative and remains open (§11); the loopback-plus-sidecar form was chosen to keep the broker dependency tree (its TCB) stdlib-only.
 - **Two independent gates on the agent → broker channel.** Tailscale supplies the encrypted transport and the *network* identity, governed by an **ACL** that lets only `tag:confidant-agent` nodes reach `tag:confidant-broker` on the proxy port. **mTLS is retained on top** as the *application-level* device identity, so the channel still fails closed if an ACL is ever misconfigured — **both gates must pass** (I-B14). The broker's TLS identity is its own enrolled cert (agent pins its SPKI), *not* a Tailscale-provisioned cert.
-- The broker joins the tailnet as an **ephemeral, tagged** node — it auto-deregisters when the enclave stops and gets a fresh identity per deploy. The **tailnet auth key is attestation-gated**: released to the enclave through the same KMS/WIF flow and unwrapped at boot, so a non-attested image cannot obtain a key and therefore cannot impersonate the broker node (I-B15).
+- The broker joins the tailnet as an **ephemeral, tagged** node — it auto-deregisters when the enclave stops and gets a fresh identity per deploy. The **tailnet auth key should be attestation-gated** (released to the enclave through the same KMS/WIF flow and unwrapped at boot), so a non-attested image cannot obtain a key and impersonate the broker node (I-B15). *Current status:* **not yet implemented** — the key is supplied as a short-lived, ephemeral, tagged Confidential Space metadata value (`TS_AUTHKEY`); gating it through KMS/WIF at boot is the remaining hardening step.
 - The agent addresses the broker by **MagicDNS** name (e.g. `confidant-broker.<tailnet>.ts.net`), never a public IP.
 
 **Request authority**
@@ -80,8 +94,13 @@ invalidate trust:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `CONFIDANT_MODE` | `dev` | `dev` enables local file-store/dev-KEK seams; `enclave` fails closed until KMS/WIF and `tsnet` are implemented |
-| `BROKER_LISTEN` | `:8443` | mTLS listener port, bound **tailnet-only** via `tsnet` (never a public interface) |
+| `CONFIDANT_MODE` | `dev` | `dev` enables local file-store/dev-KEK seams; `enclave` uses the attestation-gated KMS unwrapper and refuses a wildcard bind. Both modes are implemented |
+| `BROKER_LISTEN` | `:8443` | mTLS listener address; in `enclave` mode set to a **loopback** address (`127.0.0.1:8443`) fronted by the Tailscale sidecar. A wildcard bind is rejected in enclave mode |
+| `KMS_PROVIDER` | `gcp` | cloud KMS provider for `enclave` mode (`gcp` implemented; the `kms.KeyDecryptor` seam accepts others) |
+| `KMS_KEY` | — | KEK resource name, e.g. `projects/P/locations/global/keyRings/R/cryptoKeys/K` (required in enclave mode) |
+| `WIF_AUDIENCE` | — | Workload Identity Federation STS audience, `//iam.googleapis.com/…/providers/PROV` (required in enclave mode) |
+| `ATTESTATION_AUDIENCE` | derived | audience requested in the attestation token; defaults to the WIF provider URL |
+| `KMS_SERVICE_ACCOUNT` | — | required service account to impersonate after the STS exchange; KMS `decrypt` is granted only to this SA, and WIF policy must prove the expected workload may impersonate it |
 | `SECRET_STORE` | `gcs://…` | envelope + policy store location |
 | `SECRET_CACHE_TTL` | `0` | plaintext cache TTL; disabled until cache wipe/eviction semantics are implemented |
 | `MAX_BODY_BYTES` | `16MiB` | per-request body cap |
@@ -93,6 +112,9 @@ invalidate trust:
 | `TS_HOSTNAME` | `confidant-broker` | node name; drives the MagicDNS address |
 | `TS_TAGS` | `tag:confidant-broker` | ACL tag(s) applied to the ephemeral node |
 
+`GCP_STS_ENDPOINT`, `GCP_KMS_ENDPOINT`, and `GCP_IAMCREDENTIALS_ENDPOINT` are
+test/staging seams only and are rejected in `CONFIDANT_MODE=enclave`.
+
 **Agent identity trust:** the broker verifies agent client certs against a pinned
 enrollment CA / an allowlist of enrolled device cert fingerprints (measured config or
 a signed enrollment list — see Open Questions).
@@ -103,8 +125,8 @@ a signed enrollment list — see Open Questions).
 
 | Hop | Mechanism | Notes |
 |---|---|---|
-| agent → broker | **mTLS over Tailscale** (`tsnet`, userspace WireGuard) | **two gates:** Tailscale ACL restricts reachability to `tag:confidant-agent` (network identity), and mTLS verifies the enrolled device client cert (app identity). Broker pins the enrollment CA / fingerprint allowlist; agent pins the broker's server-cert SPKI. No public listener exists |
-| broker → KMS | **Workload Identity Federation** via Confidential Space attestation token | WIF condition binds the mintable principal to `swname==CONFIDENTIAL_SPACE`, `STABLE`, and the pinned image digest; KMS `decrypt` IAM granted only to that principal |
+| agent → broker | **mTLS over Tailscale** (userspace `tailscaled` + `tailscale serve` → loopback broker) | **two gates:** Tailscale ACL restricts reachability to `tag:confidant-agent` (network identity), and mTLS verifies the enrolled device client cert (app identity). Broker pins the enrollment CA / fingerprint allowlist; agent pins the broker's server-cert SPKI. No public listener exists |
+| broker → KMS | **Workload Identity Federation** via Confidential Space attestation token *(implemented — `internal/kms/gcp`)* | attestation token → STS token-exchange → required SA impersonation → Cloud KMS `decrypt`. WIF condition binds the mintable principal to `swname==CONFIDENTIAL_SPACE`, `STABLE`, the pinned image digest/reference, expected project, expected workload service account, and security-critical env values; KMS `decrypt` IAM is granted only to the impersonated SA |
 | broker → upstream | the **credential module** output (bearer / SigV4 / OAuth bearer) | broker verifies upstream TLS; optional SPKI pin per policy |
 
 The mTLS client identity is the agent's *device* identity, not a user secret. It
@@ -116,15 +138,22 @@ that are then bounded by per-secret spend policy.
 
 ## 5 · Attestation & KMS binding
 
-The KEK never leaves KMS. Per request (or per cache-miss):
+The KEK never leaves KMS. Per request:
 
-1. Broker presents its Confidential Space **attestation token** to WIF.
+1. Broker presents its Confidential Space **attestation token** to WIF (obtained
+   from the launcher socket `/run/container_launcher/teeserver.sock`).
 2. WIF mints a GCP principal **only if** the token's claims match the pinned condition:
 
 ```
 assertion.swname == "CONFIDENTIAL_SPACE" &&
 "STABLE" in assertion.submods.confidential_space.support_attributes &&
-assertion.submods.container.image_digest == "sha256:<pinned broker digest>"
+assertion.submods.container.image_digest == "sha256:<pinned broker digest>" &&
+assertion.submods.container.image_reference == "<expected image>@sha256:<digest>" &&
+assertion.submods.gce.project_number == "<expected project number>" &&
+"<expected workload service account>" in assertion.google_service_accounts &&
+assertion.submods.container.env["KMS_KEY"] == "<expected KMS key>" &&
+assertion.submods.container.env["WIF_AUDIENCE"] == "<expected WIF provider>" &&
+assertion.submods.container.env["KMS_SERVICE_ACCOUNT"] == "<expected broker SA>"
 ```
 
 3. KMS `decrypt(wrapped_dek)` succeeds only for that principal → DEK in enclave memory.
@@ -133,6 +162,28 @@ assertion.submods.container.image_digest == "sha256:<pinned broker digest>"
 Consequences: a stolen envelope is inert (needs a live attestation); a tampered image
 fails the digest claim and never decrypts; rotation = publish new digest → update WIF
 condition → old image loses access automatically.
+
+**Implementation.** This is the `enclave`-mode unwrapper, split across a
+cloud-agnostic seam and a provider:
+
+- `internal/kms` defines `KeyDecryptor` (unwrap a wrapped DEK — the provider seam)
+  and `EnvelopeUnwrapper`, which composes a `KeyDecryptor` with AES-256-GCM to
+  produce the plaintext secret. The AES half is provider-agnostic; adding AWS KMS
+  or Azure Key Vault is a new `KeyDecryptor` and nothing else.
+- `internal/kms/gcp` is the default provider: attestation token → STS
+  token-exchange → required service-account impersonation → Cloud KMS `decrypt`.
+  It is **stdlib-only** (plain `net/http` REST, no Google Cloud SDK) to keep the
+  broker's TCB small, matching §2.
+- Envelopes carry the alg `KMS+AES-256-GCM`: a per-secret DEK seals the secret and
+  the KEK wraps that DEK (`Envelope.WrappedDEK`). Enrollment (`enroll -kms-key`)
+  wraps the DEK with a matching Cloud KMS `encrypt`, authenticated by an operator
+  access token — not by attestation, since enrollment runs outside the enclave.
+  AES-GCM associated data binds the envelope to its record id, policy, algorithm,
+  and KMS key, so a mutable store cannot broaden spend policy without making
+  decrypt fail.
+- The DEK is fetched per unwrap and zeroized after use; only the short-lived GCP
+  access token is cached (operational state, like an OAuth token). KEK material is
+  never cached (I-B6).
 
 ---
 
@@ -208,7 +259,7 @@ call out*. The two mechanisms don't overlap.
 - **I-B10** Every request is audited exactly once with its outcome (allowed/denied + reason).
 - **I-B11** `caller` metadata never influences an authorization decision.
 - **I-B12** Concurrent requests needing the same OAuth refresh trigger exactly one refresh (single-flight).
-- **I-B13** The broker's request listener is bound only to the tailnet (`tsnet`); it has no public-internet-facing listener on any interface.
+- **I-B13** The broker's request listener has no public-internet-facing binding on any interface: in enclave mode it binds loopback and is reachable only through the Tailscale sidecar (`tailscale serve`), and a wildcard bind is rejected at startup.
 - **I-B14** Reaching the broker requires passing **both** the Tailscale ACL (agent tag) *and* mTLS (enrolled device cert); neither gate alone suffices, and both fail closed.
 - **I-B15** The tailnet auth key is attestation-gated and never exists in a non-attested context; a non-blessed image cannot join the tailnet as the broker.
 
@@ -225,8 +276,17 @@ call out*. The two mechanisms don't overlap.
 
 ## 10 · Tests
 
+> **Status.** The dev-path and enclave-KMS-path tests below are implemented and
+> green: the KMS unwrap abstraction and GCP provider (`internal/kms`,
+> `internal/kms/gcp`) are covered by unit tests driving mock STS/IAM/KMS through
+> the real HTTP layer and a real unix-socket attestation source (fail-closed on
+> STS/KMS/attestation errors, access-token caching, enroll↔unwrap round trip), and
+> enclave-mode config validation is tested. Tests tied to unbuilt features (SigV4,
+> OAuth2, streaming, the deployed-attestation E-B* cases) remain pending.
+
 ### Unit
-- Credential modules: `StaticInjector` template substitution; `Sigv4Signer` against known AWS test vectors; `OAuth2Minter` token-exchange request shape.
+- Credential modules: `StaticInjector` template substitution; `Sigv4Signer` against known AWS test vectors *(pending — module stubbed)*; `OAuth2Minter` token-exchange request shape *(pending — module stubbed)*.
+- KMS unwrap: `EnvelopeUnwrapper` round-trips a sealed envelope; the GCP provider performs attestation→STS→impersonation→decrypt and **fails closed** on any step's error; the DEK is fetched per unwrap, the KEK is never cached, and policy/id/key AAD tampering fails decrypt. *(implemented)*
 - Redaction/log hygiene: observability records and error paths carry no secret-bearing fields or values.
 - Policy evaluator: allow/deny across host, method, rate, cost, scope, `require_confirm`.
 - Zeroization: mutable plaintext buffers are wiped promptly after use; tests assert preflight denials never unwrap.
@@ -266,5 +326,6 @@ call out*. The two mechanisms don't overlap.
 - **Cache TTL vs. exposure.** Plaintext caching is disabled in the Go prototype. If added later, should static/signed secrets default to no cache, short per-policy TTLs, or a bounded 5-minute warm-path cache given SEV-SNP memory encryption?
 - **Audit sink.** GCP-internal (tamper-evident, but metadata visible to GCP) vs. streamed to a local append-only store the user controls.
 - **`require_confirm` challenge.** Broker issues a signed challenge the agent surfaces locally; define the challenge/response format and timeout.
-- **Tailnet auth-key delivery & rotation.** The bootstrap key is attestation-gated, but confirm the exact flow: KMS-release at boot → `tsnet.Up` with an ephemeral+tagged key. How often are keys rotated, and does an ephemeral node's churn interact badly with the ACL / MagicDNS TTLs?
+- **Tailnet auth-key delivery & rotation.** *Currently passed as ephemeral, tagged Confidential Space metadata (`TS_AUTHKEY`) — not yet attestation-gated.* The target flow is KMS-release at boot → tailnet join with an ephemeral+tagged key, so a non-attested image cannot obtain a key (I-B15). Confirm the exact flow, how often keys rotate, and whether an ephemeral node's churn interacts badly with the ACL / MagicDNS TTLs.
+- **`tsnet` vs. userspace `tailscaled` sidecar.** The implementation forwards inbound tailnet TCP to a loopback broker via `tailscale serve`, keeping the broker's dependency tree stdlib-only. Embedding `tsnet` would remove the sidecar process and the `tailscale serve` version coupling, at the cost of a large dependency in the TCB. Decide whether the TCB cost is worth it.
 - **mTLS vs. Tailscale identity — keep both?** We keep both deliberately (defense in depth). Revisit only if operational cost proves high; dropping mTLS would make a single ACL misconfiguration fatal, so the bar to remove it is high.

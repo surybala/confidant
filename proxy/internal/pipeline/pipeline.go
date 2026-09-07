@@ -132,8 +132,14 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 7. unwrap secret via KMS (I-B6). Zeroized immediately after use (I-B1).
-	secret, err := h.d.Unwrapper.Unwrap(r.Context(), rec.Envelope)
+	// 7. unwrap secret via KMS (I-B6). The AEAD AAD binds the ciphertext to the
+	// requested id and stored policy, so store metadata tampering fails closed.
+	aad, err := store.EnvelopeAAD(id, rec.Envelope, rec.Policy)
+	if err != nil {
+		h.deny(w, req, http.StatusServiceUnavailable, wire.CodeUnavailable, "invalid envelope context")
+		return
+	}
+	secret, err := h.d.Unwrapper.Unwrap(r.Context(), rec.Envelope, aad)
 	if err != nil {
 		h.deny(w, req, http.StatusServiceUnavailable, wire.CodeUnavailable, "secret unwrap failed")
 		return

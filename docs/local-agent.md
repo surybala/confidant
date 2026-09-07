@@ -199,14 +199,17 @@ Rules:
 
 ## 9 · Cross-component end-to-end (agent + broker + mock upstream)
 
-Run the **real agent** against the **real broker** (dev KEK in M2, Confidential Space
-in M3) with a mock upstream, driving an actual client (`curl`, then `claude code`):
+Run the **real agent** against the **real broker** with a mock upstream, driving an
+actual client (`curl`, then `claude code`). The committed `e2e/` module does this on
+the **dev-KEK** path; the **enclave** path (attestation-gated Cloud KMS unwrap) is
+implemented and exercised by the broker's own tests and the [README setup
+guide](../README.md#running-for-real-agent-on-your-laptop-broker-in-a-gcp-enclave):
 
 - **E2E-1 No local secret, successful call:** with only refs configured locally, a request to an intercepted host succeeds end-to-end; scan the agent's process memory and the local filesystem/dotfiles for the real secret string → **absent**. Prove the secret exists only in the broker.
 - **E2E-2 Malicious-lib simulation:** a stub "malicious" local process reads env, dotfiles, and hits the proxy directly; verify it obtains **no secret**, and that any calls it makes are bounded by (and audited under) the secret's spend policy.
 - **E2E-3 Exfil attempt blocked:** the stub tries to reach a non-allowlisted host through the proxy → blind-tunnelled (agent) and, if it targets a brokered secret against a disallowed host, denied at the broker; nothing leaves with a credential.
 - **E2E-4 OAuth round trip:** an intercepted OAuth API call triggers a broker-side refresh/rotation; the tool sees a normal success and no token ever appears locally.
-- **E2E-5 Attestation break (M3):** point the agent at a broker running a non-blessed image digest → calls fail closed (KMS refuses); confirm no upstream call and a clear tool-facing error.
+- **E2E-5 Attestation break:** point the agent at a broker running a non-blessed image digest → calls fail closed (KMS refuses); confirm no upstream call and a clear tool-facing error. *(The broker-side fail-closed-on-KMS-error path is unit-tested; the on-cluster digest-break check against a live Confidential Space deploy is still pending.)*
 - **E2E-6 Private path only:** the agent reaches the broker via MagicDNS over the tailnet and succeeds; from a host off the tailnet, the broker's address is unreachable. Confirms there is no public route to the broker (pairs with broker E-B4).
 
 ---

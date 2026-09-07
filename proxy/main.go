@@ -43,6 +43,7 @@ import (
 	"github.com/surybala/confidant/proxy/internal/config"
 	"github.com/surybala/confidant/proxy/internal/credmod"
 	"github.com/surybala/confidant/proxy/internal/kms"
+	"github.com/surybala/confidant/proxy/internal/kms/gcp"
 	"github.com/surybala/confidant/proxy/internal/pipeline"
 	"github.com/surybala/confidant/proxy/internal/policy"
 	"github.com/surybala/confidant/proxy/internal/server"
@@ -91,7 +92,7 @@ func runServe(args []string) error {
 	if err := cfg.ValidateForServe(); err != nil {
 		return err
 	}
-	kek, err := kms.LoadDevKEK(cfg.DevKEKPath)
+	unwrapper, err := buildUnwrapper(cfg, log)
 	if err != nil {
 		return err
 	}
@@ -113,7 +114,7 @@ func runServe(args []string) error {
 
 	h := pipeline.New(pipeline.Deps{
 		Store:     st,
-		Unwrapper: kek,
+		Unwrapper: unwrapper,
 		Modules:   credmod.Default(),
 		Limiter:   policy.NewLimiter(),
 		Egress:    cfg.EgressAllow,
@@ -203,23 +204,58 @@ func buildUpstreamClient(cfg config.Config) (*http.Client, error) {
 	return &http.Client{Timeout: cfg.UpstreamTimeout, Transport: tr}, nil
 }
 
+// buildUnwrapper selects the secret unwrapper for the running mode. Dev mode uses
+// the local dev KEK; enclave mode uses the attestation-gated cloud KMS provider
+// (GCP by default) behind kms.EnvelopeUnwrapper.
+func buildUnwrapper(cfg config.Config, log *slog.Logger) (kms.Unwrapper, error) {
+	mode := cfg.Mode
+	if mode == "" {
+		mode = config.ModeDev
+	}
+	if mode == config.ModeDev {
+		return kms.LoadDevKEK(cfg.DevKEKPath)
+	}
+
+	// enclave mode
+	switch cfg.KMSProvider {
+	case config.KMSProviderGCP, "":
+		dec, err := gcp.New(gcp.Config{
+			KMSKeyName:             cfg.KMSKeyName,
+			WIFAudience:            cfg.WIFAudience,
+			AttestationAudience:    cfg.AttestationAudience,
+			ServiceAccount:         cfg.KMSServiceAccount,
+			STSEndpoint:            cfg.GCPSTSEndpoint,
+			IAMCredentialsEndpoint: cfg.GCPIAMCredentialsEndpoint,
+			KMSEndpoint:            cfg.GCPKMSEndpoint,
+		}, gcp.WithLogger(log))
+		if err != nil {
+			return nil, fmt.Errorf("build GCP KMS provider: %w", err)
+		}
+		log.Info("enclave KMS provider ready",
+			slog.String("provider", dec.Name()),
+			slog.String("kms_key", cfg.KMSKeyName),
+			slog.Bool("impersonation", cfg.KMSServiceAccount != ""))
+		return kms.NewEnvelopeUnwrapper(dec, log)
+	default:
+		return nil, fmt.Errorf("unknown KMS_PROVIDER %q", cfg.KMSProvider)
+	}
+}
+
 func runEnroll(args []string) error {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
 	id := fs.String("id", "", "secret id, e.g. openai/personal")
-	kekPath := fs.String("kek", "dev.kek", "dev KEK file (created if missing)")
+	kekPath := fs.String("kek", "dev.kek", "dev KEK file (created if missing; dev mode only)")
 	storePath := fs.String("store", "store.json", "secret store JSON file")
 	policyPath := fs.String("policy", "", "optional policy JSON file")
 	host := fs.String("host", "", "allowed host (when no -policy given)")
 	methods := fs.String("methods", "GET,POST", "allowed methods (when no -policy given)")
+	kmsKey := fs.String("kms-key", "", "KMS KEK resource name — seals for the enclave instead of the dev KEK")
+	accessToken := fs.String("access-token", "", "GCP access token for KMS enrollment (else $GOOGLE_ACCESS_TOKEN)")
+	kmsEndpoint := fs.String("kms-endpoint", "", "override the Cloud KMS endpoint (staging/tests)")
 	_ = fs.Parse(args)
 
 	if *id == "" {
 		return errors.New("-id is required")
-	}
-
-	kek, err := loadOrCreateKEK(*kekPath)
-	if err != nil {
-		return err
 	}
 
 	secret, err := io.ReadAll(os.Stdin)
@@ -237,7 +273,20 @@ func runEnroll(args []string) error {
 		return err
 	}
 
-	env, err := kek.Seal(secret)
+	var env kms.Envelope
+	if *kmsKey != "" {
+		aad, aadErr := store.EnvelopeAADFor(*id, kms.AlgKMSGCM, *kmsKey, pol)
+		if aadErr != nil {
+			return aadErr
+		}
+		env, err = sealForEnclave(*kmsKey, *accessToken, *kmsEndpoint, secret, aad)
+	} else {
+		aad, aadErr := store.EnvelopeAADFor(*id, kms.AlgDevGCM, "", pol)
+		if aadErr != nil {
+			return aadErr
+		}
+		env, err = sealForDev(*kekPath, secret, aad)
+	}
 	if err != nil {
 		return err
 	}
@@ -253,9 +302,45 @@ func runEnroll(args []string) error {
 		return err
 	}
 
-	fmt.Printf("enrolled %q -> %s (policy: %d host(s), kind=%s)\n",
-		*id, *storePath, len(pol.AllowHosts), pol.Credential.Kind)
+	fmt.Printf("enrolled %q -> %s (alg=%s, policy: %d host(s), kind=%s)\n",
+		*id, *storePath, env.Alg, len(pol.AllowHosts), pol.Credential.Kind)
 	return nil
+}
+
+// sealForDev seals a secret under the local dev KEK (dev mode).
+func sealForDev(kekPath string, secret, aad []byte) (kms.Envelope, error) {
+	kek, err := loadOrCreateKEK(kekPath)
+	if err != nil {
+		return kms.Envelope{}, err
+	}
+	return kek.Seal(secret, aad)
+}
+
+// sealForEnclave envelope-encrypts a secret for the enclave: a fresh DEK seals the
+// secret and Cloud KMS wraps the DEK. Enrollment authenticates to KMS with an
+// operator access token (not attestation) — obtain one with
+// `gcloud auth print-access-token` and pass it via -access-token or
+// $GOOGLE_ACCESS_TOKEN.
+func sealForEnclave(kmsKey, accessToken, kmsEndpoint string, secret, aad []byte) (kms.Envelope, error) {
+	if accessToken == "" {
+		accessToken = os.Getenv("GOOGLE_ACCESS_TOKEN")
+	}
+	if accessToken == "" {
+		return kms.Envelope{}, errors.New("KMS enrollment needs a GCP access token: pass -access-token or set GOOGLE_ACCESS_TOKEN (e.g. `gcloud auth print-access-token`)")
+	}
+	client, err := gcp.New(
+		gcp.Config{KMSKeyName: kmsKey, KMSEndpoint: kmsEndpoint},
+		gcp.WithStaticAccessToken(accessToken),
+	)
+	if err != nil {
+		return kms.Envelope{}, err
+	}
+	env, err := kms.SealKMS(context.Background(), client.Encrypt, secret, aad, kmsKey)
+	if err != nil {
+		return kms.Envelope{}, fmt.Errorf("KMS seal: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "sealed under KMS key %s\n", kmsKey)
+	return env, nil
 }
 
 func loadOrCreateKEK(path string) (*kms.DevKEK, error) {

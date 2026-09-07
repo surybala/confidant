@@ -81,10 +81,12 @@ against an attestation token and scrubbed after each call.
 
 **Private connectivity (settled).** The broker is **never exposed to the public
 internet**. The agent↔broker channel runs entirely over a **Tailscale tailnet**: the
-broker binds its listener tailnet-only via embedded `tsnet` (userspace WireGuard,
-which fits the non-privileged enclave), and a Tailscale ACL restricts reachability to
-`tag:confidant-agent` nodes. **mTLS is retained on top** as a second, independent gate
-(app-level device identity), and the tailnet auth key is itself attestation-gated.
+broker binds a loopback listener that a userspace `tailscaled` sidecar fronts on the
+tailnet (`tailscale serve`, which fits the non-privileged enclave with no TUN device;
+embedded `tsnet` is the alternative kept open in broker-core.md §11), and a Tailscale
+ACL restricts reachability to `tag:confidant-agent` nodes. **mTLS is retained on top**
+as a second, independent gate (app-level device identity). The tailnet auth key is
+meant to be attestation-gated (currently supplied as ephemeral enclave metadata).
 Tailscale governs *ingress to the broker* only — egress to the real upstream APIs
 stays public and allowlisted. Details in [broker-core.md](./broker-core.md) §2/§7 and
 [local-agent.md](./local-agent.md) §2.
@@ -275,23 +277,33 @@ intercept = ["api.openai.com", "*.amazonaws.com", "api.github.com"]
 
 This is the mechanism that makes it "provably the right workload, not a VM I hope is
 clean." Confidential Space issues an OIDC **attestation token** whose claims include
-the enclave's boot measurement and the *image digest* of the broker container.
-Workload Identity Federation mints a GCP principal *only* for tokens matching those
-claims, and the KMS key's IAM binding grants `decrypt` *only* to that principal.
+the enclave's boot measurement, the broker container identity, the GCP project, the
+attached workload service account, and explicitly supplied workload env. Workload
+Identity Federation mints a GCP principal *only* for tokens matching those claims,
+and the KMS key's IAM binding grants `decrypt` only to the service account that the
+attested workload is allowed to impersonate.
 
-WIF attribute condition (release only to the blessed image):
+WIF attribute condition (release only to the blessed workload):
 
 ```
-// only a genuine Confidential Space enclave running
-// exactly this broker image can assume the identity
+// only a genuine Confidential Space enclave running this broker image
+// in the expected project, under the expected workload service account,
+// with the expected KMS configuration can assume the identity
 assertion.swname == "CONFIDENTIAL_SPACE" &&
 "STABLE" in assertion.submods.confidential_space.support_attributes &&
 assertion.submods.container.image_digest ==
-    "sha256:9f2c…<pinned broker digest>"
+    "sha256:9f2c…<pinned broker digest>" &&
+assertion.submods.container.image_reference ==
+    "<expected image>@sha256:9f2c…<pinned broker digest>" &&
+assertion.submods.gce.project_number == "<expected project number>" &&
+"<expected workload service account>" in assertion.google_service_accounts &&
+assertion.submods.container.env["KMS_KEY"] == "<expected KMS key>" &&
+assertion.submods.container.env["WIF_AUDIENCE"] == "<expected WIF provider>" &&
+assertion.submods.container.env["KMS_SERVICE_ACCOUNT"] == "<expected broker SA>"
 ```
 
 - **Stolen envelope:** useless — it only unwraps against a live attestation token.
-- **Tampered broker image:** the digest claim no longer matches; KMS refuses; nothing decrypts.
+- **Wrong workload/config:** the image/project/service-account/env claims no longer match; KMS refuses; nothing decrypts.
 - **GCP-operator snooping:** memory is hardware-encrypted (SEV-SNP); the operator sees ciphertext.
 - **Rotation:** ship a new broker digest → update the WIF condition → old image loses key access automatically.
 
@@ -328,10 +340,19 @@ the network allowlist still cannot leave.
 
 ## 09 · Build milestones (~3 weeks)
 
-- **M1 · Broker core, no TEE yet (~4 days).** Broker as a plain container: mTLS in, envelope-decrypt with a local dev KEK, inject + proxy one upstream (OpenAI), scrub + audit. Prove the request/response path end to end against a stub client.
-- **M2 · The local agent (~4 days).** Forward proxy with local CA, ref recognition and rewriting, warm mTLS connection to the broker, config loading. Point real `claude code` / `curl` at it and watch a call succeed with no local key.
-- **M3 · Confidential Space + attestation (~5 days).** Deploy the broker image to Confidential Space; wire WIF + KMS with the image-digest condition; move envelopes to GCS. Verify a tampered digest is refused decryption. This is the milestone that makes it real.
-- **M4 · Policy, egress, ergonomics (~4 days).** Spend policy enforcement (hosts, rate, cost caps), VPC egress allowlist, `confidant enroll` (string + OAuth-consent modes), audit log surface, and the credential modules beyond static bearer — the SigV4 signer and the OAuth2 minter (§04a). Dogfood for a week on your own keys.
+> **Status (2026-09-07).** M1 and M2 are complete. M3 is largely done — the
+> attestation-gated Cloud KMS + WIF unwrapper is implemented and tested behind a
+> cloud-provider abstraction (GCP default), enclave mode runs, and the [README
+> setup guide](../README.md#running-for-real-agent-on-your-laptop-broker-in-a-gcp-enclave)
+> deploys it to Confidential Space; a GCS-backed envelope store and an on-cluster
+> tampered-digest E2E check are still outstanding, and the tailnet key is not yet
+> attestation-gated. M4 is not started (static bearer only; SigV4/OAuth2 stubbed
+> and fail closed; spend policy covers host/method today).
+
+- **M1 · Broker core, no TEE yet (~4 days). ✅ done.** Broker as a plain container: mTLS in, envelope-decrypt with a local dev KEK, inject + proxy one upstream (OpenAI), scrub + audit. Prove the request/response path end to end against a stub client.
+- **M2 · The local agent (~4 days). ✅ done.** Forward proxy with local CA, ref recognition and rewriting, warm mTLS connection to the broker, config loading. Point real `claude code` / `curl` at it and watch a call succeed with no local key.
+- **M3 · Confidential Space + attestation (~5 days). ◑ mostly done.** Deploy the broker image to Confidential Space; wire WIF + KMS with the image-digest condition (implemented, stdlib-only); verify a tampered digest is refused decryption. *Remaining:* move envelopes to GCS (still a baked-in file), attestation-gated tailnet auth key, and the deployed-image E2E digest-break check.
+- **M4 · Policy, egress, ergonomics (~4 days). ◻ not started.** Spend policy enforcement (hosts, rate, cost caps), VPC egress allowlist, `confidant enroll` (string + OAuth-consent modes), audit log surface, and the credential modules beyond static bearer — the SigV4 signer and the OAuth2 minter (§04a). Dogfood for a week on your own keys.
 
 **Broker uptime (settled):** an **always-warm Confidential VM**. A few dollars/day
 idle buys an instant path — one persistent mTLS connection, no per-call enclave boot
