@@ -26,8 +26,8 @@ isolated (the broker's tree is part of its trusted computing base):
 ## Status
 
 Phase-1 **functional**, stdlib-only (builds offline, no dependencies). Both the
-local **dev** path and the GCP **enclave** unwrap path are implemented; see the
-[GCP enclave setup guide](#setting-up-the-gcp-enclave-broker) to run it for real.
+local **dev** path and the GCP **enclave** unwrap path are implemented; see
+[Running for real](#running-for-real) to use the enclave broker.
 
 - **`confidant-agent`** — a real loopback CONNECT proxy: blind-tunnels
   non-intercepted hosts, and for intercepted hosts MITM-terminates with a
@@ -102,11 +102,11 @@ CONFIDANT_INTERCEPT="api.openai.com" CONFIDANT_BROKER="https://127.0.0.1:8443" \
 The `e2e` test wires all of this together automatically — see
 [e2e/e2e_test.go](e2e/e2e_test.go).
 
-## Running for real: agent on your laptop, broker in a GCP enclave
+## Running for Real
 
-This is the full credential-free setup. When you finish, a tool on your laptop
-makes an authenticated API call while the real key exists **only** inside an
-attested GCP enclave — never on your machine, never in your app's environment.
+This is the full credential-free path: a tool on your laptop makes an
+authenticated API call while the real key exists **only** inside an attested GCP
+Confidential Space workload.
 
 ```
 your app ──HTTPS_PROXY──▶ confidant-agent ──mTLS over Tailscale──▶ confidant-proxy
@@ -117,250 +117,421 @@ your app ──HTTPS_PROXY──▶ confidant-agent ──mTLS over Tailscale─
 ```
 
 Two gates protect the agent→broker channel (invariant I-B14): the **Tailscale
-ACL** (network identity) and **mTLS** (device identity). The secret is unwrapped
-only under a live Confidential Space attestation that matches the pinned image
-digest (I-B6); a stolen envelope or a tampered image decrypts nothing.
+ACL** (network identity) and **mTLS** (device identity). Cloud KMS unwrap only
+succeeds under a live Confidential Space attestation that matches the pinned
+image digest (I-B6).
 
-### Prerequisites
+### Setup
 
-- A GCP project with billing (`PROJECT_ID`, and its numeric `PROJECT_NUMBER`).
-- `gcloud` authenticated (`gcloud auth login`), `docker`, `openssl`, Go 1.22+.
-- A [Tailscale](https://tailscale.com) tailnet you administer.
-- APIs enabled:
-  ```bash
-  gcloud services enable cloudkms.googleapis.com iamcredentials.googleapis.com \
-      sts.googleapis.com artifactregistry.googleapis.com compute.googleapis.com \
-      confidentialcomputing.googleapis.com
-  ```
+Prerequisites:
 
-Throughout, replace `PROJECT_ID`, `PROJECT_NUMBER`, `REGION`, `ZONE`, and
-`TAILNET` (your tailnet's name, e.g. `example.ts.net`) with your values.
+- A GCP project with billing.
+- `gcloud` authenticated with `gcloud auth login`.
+- Docker with Buildx, `openssl`, Go 1.22+, and Tailscale.
+- A Tailscale tailnet with MagicDNS enabled.
 
-### Part 1 — Enrollment CA and device identity (the mTLS trust root)
-
-The broker trusts agents whose client certs are signed by an enrollment CA; the
-agent pins the broker's server-cert public key. Create them once:
+Start at the repo root and export deployment variables once. Edit only this
+block; the commands below are copy-pasteable after that.
 
 ```bash
-# Enrollment CA — signs agent device certs; the broker trusts it via CLIENT_CA.
+export PROJECT_ID="your-gcp-project-id"
+export REGION="us-central1"
+export ZONE="us-central1-a"
+
+export KMS_LOCATION="global"
+export KMS_KEYRING="confidant"
+export KMS_KEY_NAME="broker-kek"
+export WIF_LOCATION="global"
+export WIF_POOL="confidant-pool"
+export WIF_PROVIDER="confidant-provider"
+export BROKER_SA_NAME="confidant-broker"
+export BROKER_INSTANCE="confidant-broker"
+export BROKER_TS_TAG="tag:confidant-broker"
+export AGENT_TS_TAG="tag:confidant-agent"
+export AR_REPOSITORY="confidant"
+export IMAGE_NAME="confidant-proxy"
+export EGRESS_ALLOW="api.openai.com"
+export SECRET_REF_ID="openai/personal"
+export SECRET_HOST="api.openai.com"
+export SECRET_METHODS="GET,POST"
+
+export TAILNET_DNS="$(tailscale status --json | python3 -c 'import json,sys; s=json.load(sys.stdin); print((s.get("CurrentTailnet") or {}).get("MagicDNSSuffix") or s.get("MagicDNSSuffix") or "")')"
+if [ -z "${TAILNET_DNS}" ]; then
+    echo "TAILNET_DNS is empty; enable Tailscale MagicDNS or set your tailnet DNS suffix manually" >&2
+    exit 1
+fi
+
+gcloud config set project "${PROJECT_ID}"
+
+export PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
+export OPERATOR_ACCOUNT="$(gcloud config get-value account)"
+export BROKER_SA="${BROKER_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+export KMS_KEY_RESOURCE="projects/${PROJECT_ID}/locations/${KMS_LOCATION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_KEY_NAME}"
+export WIF_AUDIENCE="//iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/${WIF_LOCATION}/workloadIdentityPools/${WIF_POOL}/providers/${WIF_PROVIDER}"
+export IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
+```
+
+Enable APIs:
+
+```bash
+gcloud services enable cloudkms.googleapis.com iamcredentials.googleapis.com \
+    sts.googleapis.com artifactregistry.googleapis.com compute.googleapis.com \
+    confidentialcomputing.googleapis.com
+```
+
+Create the enrollment CA, this laptop's mTLS device cert, and the broker server
+cert. The broker trusts the enrollment CA; the local agent pins the broker
+server certificate's public key.
+
+```bash
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
     -keyout enroll-ca.key -out enroll-ca.pem -days 3650 -subj "/CN=Confidant Enrollment CA"
 
-# A device cert for this laptop, signed by the enrollment CA.
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
     -keyout agent-device.key -out agent-device.csr -subj "/CN=my-laptop"
 openssl x509 -req -in agent-device.csr -CA enroll-ca.pem -CAkey enroll-ca.key \
     -CAcreateserial -out agent-device.crt -days 825
 
-# The broker's own server cert (self-signed: the agent pins its SPKI, not a chain).
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    -keyout broker.key -out broker.crt -days 825 -subj "/CN=confidant-broker"
-```
+    -keyout broker.key -out broker.crt -days 825 -subj "/CN=${BROKER_INSTANCE}"
 
-Compute the broker's **SPKI pin** — the agent will refuse any other key:
-
-```bash
-printf 'sha256/'; openssl x509 -in broker.crt -pubkey -noout \
+export BROKER_SPKI_PIN="$(printf 'sha256/'; openssl x509 -in broker.crt -pubkey -noout \
     | openssl pkey -pubin -outform der \
-    | openssl dgst -sha256 -binary | base64
+    | openssl dgst -sha256 -binary | base64)"
+printf '%s\n' "${BROKER_SPKI_PIN}"
 ```
 
-Save that `sha256/…` string; it becomes the agent's `server_spki_pin`.
-
-### Part 2 — Cloud KMS + Workload Identity Federation
-
-Create the key-encryption key (the KEK never leaves KMS):
+Create KMS, IAM, and a deny-all Workload Identity provider. The provider is
+repinned after the image digest exists.
 
 ```bash
-gcloud kms keyrings create confidant --location=global
-gcloud kms keys create broker-kek --keyring=confidant --location=global --purpose=encryption
-```
+gcloud kms keyrings create "${KMS_KEYRING}" --location="${KMS_LOCATION}"
+gcloud kms keys create "${KMS_KEY_NAME}" \
+    --keyring="${KMS_KEYRING}" --location="${KMS_LOCATION}" --purpose=encryption
 
-Create a service account the broker impersonates, and let it decrypt with the KEK:
+gcloud iam service-accounts create "${BROKER_SA_NAME}" --display-name="Confidant broker"
 
-```bash
-gcloud iam service-accounts create confidant-broker --display-name="Confidant broker"
-BROKER_SA="confidant-broker@PROJECT_ID.iam.gserviceaccount.com"
-KMS_KEY_RESOURCE="projects/PROJECT_ID/locations/global/keyRings/confidant/cryptoKeys/broker-kek"
-WIF_AUDIENCE="//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/confidant-pool/providers/confidant-provider"
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:${BROKER_SA}" \
+    --role=roles/confidentialcomputing.workloadUser
 
-gcloud kms keys add-iam-policy-binding broker-kek \
-    --keyring=confidant --location=global \
+gcloud kms keys add-iam-policy-binding "${KMS_KEY_NAME}" \
+    --keyring="${KMS_KEYRING}" --location="${KMS_LOCATION}" \
     --member="serviceAccount:${BROKER_SA}" \
     --role=roles/cloudkms.cryptoKeyDecrypter
-```
 
-Create the WIF pool + provider. You don't have the image digest yet, so create
-the provider in a deny-all state and tighten the condition with the real digest
-in Part 4. The **attribute condition** is the security gate: KMS releases the key
-only to a genuine Confidential Space enclave running the expected image, in the
-expected project, under the expected workload service account, with the expected
-security-critical env values.
+gcloud iam workload-identity-pools create "${WIF_POOL}" --location="${WIF_LOCATION}"
 
-```bash
-gcloud iam workload-identity-pools create confidant-pool --location=global
-
-gcloud iam workload-identity-pools providers create-oidc confidant-provider \
-    --location=global --workload-identity-pool=confidant-pool \
+gcloud iam workload-identity-pools providers create-oidc "${WIF_PROVIDER}" \
+    --location="${WIF_LOCATION}" --workload-identity-pool="${WIF_POOL}" \
     --issuer-uri="https://confidentialcomputing.googleapis.com/" \
     --attribute-mapping="google.subject=assertion.sub,attribute.image_digest=assertion.submods.container.image_digest" \
     --attribute-condition="false"
 ```
 
-The service-account impersonation grant is added in Part 4 after the digest is
-known, scoped to that digest instead of the whole pool.
-
-Three values feed the broker's config:
-- `KMS_KEY` = `${KMS_KEY_RESOURCE}`
-- `WIF_AUDIENCE` = `${WIF_AUDIENCE}`
-- `KMS_SERVICE_ACCOUNT` = `${BROKER_SA}`
-
-### Part 3 — Enroll your secrets (sealed to KMS)
-
-Enrollment seals each secret under a fresh per-secret DEK and wraps that DEK with
-the KEK. It authenticates to KMS with **your** operator identity — grant yourself
-encrypt, then pass a short-lived token:
+Enroll the secret. `store.json` contains ciphertext only, but it is baked into
+the broker image and must be restaged before every image build.
 
 ```bash
-gcloud kms keys add-iam-policy-binding broker-kek --keyring=confidant --location=global \
-    --member="user:$(gcloud config get-value account)" --role=roles/cloudkms.cryptoKeyEncrypter
+gcloud kms keys add-iam-policy-binding "${KMS_KEY_NAME}" \
+    --keyring="${KMS_KEYRING}" --location="${KMS_LOCATION}" \
+    --member="user:${OPERATOR_ACCOUNT}" --role=roles/cloudkms.cryptoKeyEncrypter
 
 make build
-printf 'sk-live-your-real-openai-key' | GOOGLE_ACCESS_TOKEN="$(gcloud auth print-access-token)" \
+printf 'Secret value to enroll for %s: ' "${SECRET_REF_ID}"
+IFS= read -r SECRET_VALUE
+printf '%s' "${SECRET_VALUE}" | GOOGLE_ACCESS_TOKEN="$(gcloud auth print-access-token)" \
     ./bin/confidant-proxy enroll \
-        -id openai/personal \
+        -id "${SECRET_REF_ID}" \
         -kms-key "${KMS_KEY_RESOURCE}" \
-        -store store.json -host api.openai.com -methods GET,POST
+        -store store.json -host "${SECRET_HOST}" -methods "${SECRET_METHODS}"
+unset SECRET_VALUE
 ```
 
-`store.json` now holds only ciphertext (`alg=KMS+AES-256-GCM`). Copy it into the
-build context so it ships in the image (safe — it is inert without a live
-attestation): `cp store.json proxy/deploy/store.json`.
+### Deploy Broker
 
-### Part 4 — Build, push, and deploy the broker to Confidential Space
+#### Runtime IAM
 
-A [`Dockerfile`](proxy/Dockerfile) and [entrypoint](proxy/deploy/entrypoint.sh)
-are included. The entrypoint runs Tailscale in userspace mode (Confidential Space
-has no TUN device) and forwards inbound tailnet TCP to the broker's loopback
-listener, so the broker has **no public listener** (I-B13).
+Create the Artifact Registry repo and grant the VM service account the runtime
+permissions it needs. The image pull grant is required; log writer is strongly
+recommended because Confidential Space launcher failures are otherwise easiest
+to find on the serial console.
 
 ```bash
-gcloud artifacts repositories create confidant --repository-format=docker --location=REGION
-gcloud auth configure-docker REGION-docker.pkg.dev
+gcloud artifacts repositories create "${AR_REPOSITORY}" \
+    --repository-format=docker --location="${REGION}"
+gcloud auth configure-docker "${REGION}-docker.pkg.dev"
 
-IMAGE="REGION-docker.pkg.dev/PROJECT_ID/confidant/confidant-proxy"
-docker build -t "$IMAGE:v1" proxy/
-docker push "$IMAGE:v1"
+gcloud artifacts repositories add-iam-policy-binding "${AR_REPOSITORY}" \
+    --location="${REGION}" \
+    --member="serviceAccount:${BROKER_SA}" \
+    --role=roles/artifactregistry.reader
 
-# Get the immutable digest and pin it in the WIF condition from Part 2.
-docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:v1"
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:${BROKER_SA}" \
+    --role=roles/logging.logWriter
 ```
 
-Pin that digest into the WIF condition so only this exact workload can decrypt.
-The policy binds the image digest, image reference, GCP project, workload service
-account, and the security-critical `tee-env` values. That way the enclave has to
-be the right code running in the right place with the expected KMS configuration,
-not merely any VM that can run the same container digest:
+#### Build and Push Image
+
+Build and push the broker image. The certs, key, enrollment CA, and store must
+be copied into `proxy/deploy/` **before** the build, because the Dockerfile bakes
+that directory into `/deploy/`. Use Buildx and `linux/amd64` for Confidential
+Space, including on Apple Silicon.
 
 ```bash
-IMAGE_REF="${IMAGE}@sha256:IMAGE_DIGEST"
+cp broker.crt broker.key enroll-ca.pem store.json proxy/deploy/
 
-gcloud iam workload-identity-pools providers update-oidc confidant-provider \
-    --location=global --workload-identity-pool=confidant-pool \
-    --attribute-condition="assertion.swname=='CONFIDENTIAL_SPACE' && 'STABLE' in assertion.submods.confidential_space.support_attributes && assertion.submods.container.image_digest=='sha256:IMAGE_DIGEST' && assertion.submods.container.image_reference=='${IMAGE_REF}' && assertion.submods.gce.project_number=='PROJECT_NUMBER' && '${BROKER_SA}' in assertion.google_service_accounts && assertion.submods.container.env['KMS_KEY']=='${KMS_KEY_RESOURCE}' && assertion.submods.container.env['WIF_AUDIENCE']=='${WIF_AUDIENCE}' && assertion.submods.container.env['KMS_SERVICE_ACCOUNT']=='${BROKER_SA}'"
+for f in \
+    proxy/deploy/entrypoint.sh \
+    proxy/deploy/broker.crt \
+    proxy/deploy/broker.key \
+    proxy/deploy/enroll-ca.pem \
+    proxy/deploy/store.json; do
+    if [ ! -s "$f" ]; then
+        echo "missing required deploy input: $f" >&2
+        exit 1
+    fi
+done
+
+export IMAGE_TAG="v$(date -u +%Y%m%d%H%M%S)"
+
+docker buildx build --platform linux/amd64 --no-cache --pull --load \
+    -t "${IMAGE}:${IMAGE_TAG}" proxy/
+
+docker image inspect "${IMAGE}:${IMAGE_TAG}" --format '{{.Os}}/{{.Architecture}}'
+docker image inspect "${IMAGE}:${IMAGE_TAG}" \
+    --format '{{ index .Config.Labels "tee.launch_policy.allow_env_override" }}'
+if ! docker run --rm --platform linux/amd64 --entrypoint /bin/sh "${IMAGE}:${IMAGE_TAG}" -c \
+    'test -s /deploy/broker.crt && test -s /deploy/broker.key && test -s /deploy/enroll-ca.pem && test -s /deploy/store.json'; then
+    echo "image is missing baked deploy files; rebuild before pushing" >&2
+    exit 1
+fi
+
+docker push "${IMAGE}:${IMAGE_TAG}"
+export IMAGE_REF="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${IMAGE_TAG}")"
+export IMAGE_DIGEST="${IMAGE_REF##*@}"
+printf 'IMAGE_REF=%s\nIMAGE_DIGEST=%s\n' "${IMAGE_REF}" "${IMAGE_DIGEST}"
+```
+
+#### Pin WIF
+
+Pin Workload Identity Federation to the immutable digest and the
+security-critical KMS env values.
+
+```bash
+test -n "${IMAGE_REF}"
+test -n "${IMAGE_DIGEST}"
+
+gcloud iam workload-identity-pools providers update-oidc "${WIF_PROVIDER}" \
+    --location="${WIF_LOCATION}" --workload-identity-pool="${WIF_POOL}" \
+    --attribute-condition="assertion.swname=='CONFIDENTIAL_SPACE' && 'STABLE' in assertion.submods.confidential_space.support_attributes && assertion.submods.container.image_digest=='${IMAGE_DIGEST}' && assertion.submods.container.image_reference=='${IMAGE_REF}' && assertion.submods.gce.project_number=='${PROJECT_NUMBER}' && '${BROKER_SA}' in assertion.google_service_accounts && assertion.submods.container.env['KMS_KEY']=='${KMS_KEY_RESOURCE}' && assertion.submods.container.env['WIF_AUDIENCE']=='${WIF_AUDIENCE}' && assertion.submods.container.env['KMS_SERVICE_ACCOUNT']=='${BROKER_SA}'"
 
 gcloud iam service-accounts add-iam-policy-binding "${BROKER_SA}" \
     --role=roles/iam.workloadIdentityUser \
-    --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/confidant-pool/attribute.image_digest/sha256:IMAGE_DIGEST"
+    --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/${WIF_LOCATION}/workloadIdentityPools/${WIF_POOL}/attribute.image_digest/${IMAGE_DIGEST}"
 ```
 
-Mint an **ephemeral, tagged** Tailscale auth key in
-the Tailscale admin console (Settings → Keys: reusable off, ephemeral on, tag
-`tag:confidant-broker`), then deploy:
+#### Create VM
+
+Mint a **single-use, ephemeral, tagged** Tailscale auth key in the Tailscale admin
+console with tag `${BROKER_TS_TAG}`, then create the Confidential Space VM.
 
 ```bash
-gcloud compute instances create confidant-broker --zone=ZONE \
+printf 'Tailscale auth key for %s: ' "${BROKER_INSTANCE}"
+IFS= read -r TS_AUTHKEY
+export TS_AUTHKEY
+
+gcloud compute instances create "${BROKER_INSTANCE}" --zone="${ZONE}" \
     --confidential-compute-type=SEV --shielded-secure-boot --maintenance-policy=TERMINATE \
     --image-project=confidential-space-images --image-family=confidential-space \
     --service-account="${BROKER_SA}" --scopes=cloud-platform \
-    --metadata="^~^tee-image-reference=${IMAGE}@sha256:IMAGE_DIGEST~tee-container-log-redirect=true~tee-env-KMS_KEY=${KMS_KEY_RESOURCE}~tee-env-WIF_AUDIENCE=${WIF_AUDIENCE}~tee-env-KMS_SERVICE_ACCOUNT=${BROKER_SA}~tee-env-EGRESS_ALLOW=api.openai.com~tee-env-SECRET_STORE=/deploy/store.json~tee-env-TLS_CERT=/deploy/broker.crt~tee-env-TLS_KEY=/deploy/broker.key~tee-env-CLIENT_CA=/deploy/enroll-ca.pem~tee-env-TS_AUTHKEY=tskey-auth-xxxx"
+    --metadata="^~^tee-image-reference=${IMAGE_REF}~tee-container-log-redirect=true~tee-env-KMS_KEY=${KMS_KEY_RESOURCE}~tee-env-WIF_AUDIENCE=${WIF_AUDIENCE}~tee-env-KMS_SERVICE_ACCOUNT=${BROKER_SA}~tee-env-EGRESS_ALLOW=${EGRESS_ALLOW}~tee-env-SECRET_STORE=/deploy/store.json~tee-env-TLS_CERT=/deploy/broker.crt~tee-env-TLS_KEY=/deploy/broker.key~tee-env-CLIENT_CA=/deploy/enroll-ca.pem~tee-env-TS_HOSTNAME=${BROKER_INSTANCE}~tee-env-TS_TAGS=${BROKER_TS_TAG}~tee-env-TS_AUTHKEY=${TS_AUTHKEY}"
 ```
 
-> Put `broker.crt`, `broker.key`, and `enroll-ca.pem` into `proxy/deploy/` before
-> the build so they land at `/deploy/…`. `broker.key` and `TS_AUTHKEY` are
-> sensitive — see the hardening note below.
+#### Tailscale ACL
 
-Configure the Tailscale **ACL** so only agents can reach the broker (Access
-Controls in the admin console):
-
-```jsonc
-{
-  "tagOwners": { "tag:confidant-agent": ["autogroup:admin"], "tag:confidant-broker": ["autogroup:admin"] },
-  "acls": [
-    { "action": "accept", "src": ["tag:confidant-agent"], "dst": ["tag:confidant-broker:8443"] }
-  ]
-}
-```
-
-### Part 5 — Run the local agent
-
-Join your laptop to the tailnet tagged as an agent, then run the agent pointed at
-the broker's MagicDNS name. Write the agent config (no secrets — see
-[agent/agent.example.toml](agent/agent.example.toml)):
+Configure the Tailscale ACL so only tagged agents can reach the broker:
 
 ```bash
-tailscale up --advertise-tags=tag:confidant-agent
+cat <<JSON
+{
+  "tagOwners": { "${AGENT_TS_TAG}": ["autogroup:admin"], "${BROKER_TS_TAG}": ["autogroup:admin"] },
+  "acls": [
+    { "action": "accept", "src": ["${AGENT_TS_TAG}"], "dst": ["${BROKER_TS_TAG}:8443"] }
+  ]
+}
+JSON
+```
+
+### Run Agent
+
+Join your laptop to the tailnet as an agent, write the secretless local config,
+and start the loopback proxy.
+
+```bash
+tailscale up --advertise-tags="${AGENT_TS_TAG}"
 
 cat > agent.json <<JSON
 {
   "listen": "127.0.0.1:8317",
-  "broker_endpoint": "https://confidant-broker.TAILNET.ts.net:8443",
+  "broker_endpoint": "https://${BROKER_INSTANCE}.${TAILNET_DNS}:8443",
   "client_cert_path": "agent-device.crt",
   "client_key_path": "agent-device.key",
-  "server_spki_pin": "sha256/PASTE_THE_PIN_FROM_PART_1",
+  "server_spki_pin": "${BROKER_SPKI_PIN}",
   "ca_cert_path": "agent-mitm-ca.crt",
   "ca_key_path": "agent-mitm-ca.key",
-  "intercept": ["api.openai.com"],
-  "refs": { "cfdt:openai/personal": "openai/personal" }
+  "intercept": ["${SECRET_HOST}"],
+  "refs": { "cfdt:${SECRET_REF_ID}": "${SECRET_REF_ID}" }
 }
 JSON
 
 ./bin/confidant-agent -config agent.json -ca-export ./agent-mitm-ca.pem -log-level info
 ```
 
-The agent mints its local MITM CA on first run and exports it to
-`agent-mitm-ca.pem`. Trust that CA for your tool (it signs the localhost TLS the
-tool sees; it is unrelated to the broker's identity).
-
-### Part 6 — Run your app credential-free
-
-Point the tool at the agent and give it the **ref**, not a key:
+The agent mints a local MITM CA on first run and exports it to
+`agent-mitm-ca.pem`; your tool must trust that CA. The local app environment gets
+only the inert ref:
 
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:8317
-export SSL_CERT_FILE="$PWD/agent-mitm-ca.pem"   # trust the agent's MITM CA
-export OPENAI_API_KEY="cfdt:openai/personal"    # the inert reference, never a real key
-
-your-app   # e.g. a script that calls api.openai.com
+export SSL_CERT_FILE="$PWD/agent-mitm-ca.pem"
+export OPENAI_API_KEY="cfdt:${SECRET_REF_ID}"
 ```
 
-The call flows tool → agent → (Tailscale + mTLS) → broker. The broker attests,
-unwraps `openai/personal` from KMS, injects the real bearer, calls OpenAI, scrubs
-the response, and audits it. Your laptop and your app's environment never hold the
-secret. Verify with `gcloud compute instances get-serial-port-output confidant-broker`
-(logs are secret-free) — you'll see the request audited, with no key material.
+### Testing
 
-### Hardening notes (known gaps)
+First verify the broker is reachable over Tailscale + mTLS:
 
-- **`TS_AUTHKEY` is passed as enclave metadata.** The spec calls for it to be
-  attestation-gated (unwrapped at boot via the same KMS/WIF flow, I-B15); that
-  delivery is not yet implemented. Use a short-lived ephemeral key and rotate it.
+```bash
+tailscale ping "${BROKER_INSTANCE}.${TAILNET_DNS}"
+curl -sk --cert agent-device.crt --key agent-device.key \
+    "https://${BROKER_INSTANCE}.${TAILNET_DNS}:8443/healthz"
+```
+
+The health check should print `ok`.
+
+For an OpenAI text-to-speech smoke test, send a tiny speech request through the
+agent. This matches a restricted key that only has text-to-voice permission.
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:8317
+export SSL_CERT_FILE="$PWD/agent-mitm-ca.pem"
+export OPENAI_API_KEY="cfdt:${SECRET_REF_ID}"
+
+curl -sS https://api.openai.com/v1/audio/speech \
+    -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "gpt-4o-mini-tts",
+      "voice": "alloy",
+      "input": "Confidant text to speech test succeeded.",
+      "response_format": "mp3"
+    }' \
+    -o confidant-tts-test.mp3 \
+    -w "http_code=%{http_code} content_type=%{content_type} size=%{size_download}\n"
+
+file confidant-tts-test.mp3
+ls -lh confidant-tts-test.mp3
+```
+
+A `200` response with `audio/mpeg` proves the full path: local app → agent →
+Tailscale + mTLS → broker → KMS unwrap → OpenAI. If OpenAI returns a missing
+scope error, Confidant still reached OpenAI; update the restricted key scopes, or
+re-enroll and rebuild if you replace the key value.
+
+To inspect broker-side audit:
+
+```bash
+gcloud compute instances get-serial-port-output "${BROKER_INSTANCE}" \
+    --zone="${ZONE}" --port=1
+```
+
+Broker request/audit logs should not contain API key material, but Confidential
+Space launcher diagnostics can include attestation claims with container env
+values. Do not copy launcher logs that contain sensitive env values.
+
+### Rebuild and Replace
+
+Rebuild whenever broker code, `proxy/deploy/entrypoint.sh`, certs/keys, or
+`store.json` change. Because the image digest is part of the WIF condition, every
+new image must be pushed, repinned, and deployed by digest.
+
+1. Run [Build and Push Image](#build-and-push-image) again. It restages
+   `/deploy`, builds `linux/amd64`, verifies the baked files and launch-policy
+   labels, pushes, and exports `IMAGE_REF` / `IMAGE_DIGEST`.
+2. Run [Pin WIF](#pin-wif) again so KMS trusts the new immutable digest.
+3. Mint a fresh single-use Tailscale auth key and replace the VM:
+
+```bash
+printf 'Tailscale auth key for %s: ' "${BROKER_INSTANCE}"
+IFS= read -r TS_AUTHKEY
+export TS_AUTHKEY
+
+gcloud compute instances delete "${BROKER_INSTANCE}" --zone="${ZONE}" --quiet
+
+gcloud compute instances create "${BROKER_INSTANCE}" --zone="${ZONE}" \
+    --confidential-compute-type=SEV --shielded-secure-boot --maintenance-policy=TERMINATE \
+    --image-project=confidential-space-images --image-family=confidential-space \
+    --service-account="${BROKER_SA}" --scopes=cloud-platform \
+    --metadata="^~^tee-image-reference=${IMAGE_REF}~tee-container-log-redirect=true~tee-env-KMS_KEY=${KMS_KEY_RESOURCE}~tee-env-WIF_AUDIENCE=${WIF_AUDIENCE}~tee-env-KMS_SERVICE_ACCOUNT=${BROKER_SA}~tee-env-EGRESS_ALLOW=${EGRESS_ALLOW}~tee-env-SECRET_STORE=/deploy/store.json~tee-env-TLS_CERT=/deploy/broker.crt~tee-env-TLS_KEY=/deploy/broker.key~tee-env-CLIENT_CA=/deploy/enroll-ca.pem~tee-env-TS_HOSTNAME=${BROKER_INSTANCE}~tee-env-TS_TAGS=${BROKER_TS_TAG}~tee-env-TS_AUTHKEY=${TS_AUTHKEY}"
+```
+
+Single-use ephemeral Tailscale auth keys are expected to show as invalidated
+after a successful join. That does not break a currently running broker, but
+this image uses `--state=mem:`, so every VM/container restart needs a fresh auth
+key in metadata.
+
+```bash
+printf 'New Tailscale auth key for %s: ' "${BROKER_INSTANCE}"
+IFS= read -r TS_AUTHKEY
+export TS_AUTHKEY
+
+gcloud compute instances add-metadata "${BROKER_INSTANCE}" \
+    --zone="${ZONE}" \
+    --metadata="tee-env-TS_AUTHKEY=${TS_AUTHKEY}"
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `failed to fetch oauth token: 403 Forbidden` while pulling the image | VM service account cannot read Artifact Registry | Grant `roles/artifactregistry.reader` on the repository to `${BROKER_SA}` |
+| `confidentialcomputing.locations.list` denied | VM service account lacks Confidential Space workload permissions | Grant `roles/confidentialcomputing.workloadUser` on the project |
+| `env var ... is not allowed to be overridden on this image` | Image was built without `tee.launch_policy.allow_env_override` labels | Rebuild with the current Dockerfile, push, repin WIF, and redeploy |
+| `logging.logEntries.create denied` | Log redirect is enabled but the VM service account cannot write logs | Grant `roles/logging.logWriter`, or read serial-console output |
+| `lookup confidant-broker.<tailnet>: no such host` | Broker did not join Tailscale, wrong `TAILNET_DNS`, or MagicDNS disabled | Check serial output, confirm `${TAILNET_DNS}`, then retry after fixing launcher errors |
+| Agent returns `broker_unreachable` | Agent config points at the wrong broker endpoint, broker is down, or Tailscale ACL blocks it | Check `agent.json`, broker `/healthz`, and Tailscale ACLs |
+
+Useful checks:
+
+```bash
+gcloud compute instances describe "${BROKER_INSTANCE}" \
+    --zone="${ZONE}" \
+    --format='value(status,lastStartTimestamp,lastStopTimestamp)'
+
+gcloud compute instances get-serial-port-output "${BROKER_INSTANCE}" \
+    --zone="${ZONE}" --port=1
+
+tailscale ping "${BROKER_INSTANCE}.${TAILNET_DNS}"
+
+curl -sk --cert agent-device.crt --key agent-device.key \
+    "https://${BROKER_INSTANCE}.${TAILNET_DNS}:8443/healthz"
+```
+
+### Hardening Notes
+
+- **`TS_AUTHKEY` is passed as enclave metadata.** The intended production shape is
+  attestation-gated delivery, unwrapped at boot via the same KMS/WIF flow
+  (I-B15). Until then, use single-use ephemeral keys, rotate after debugging, and
+  avoid sharing serial-console or launcher logs.
 - **`broker.key` is baked into the image.** For production, generate the broker's
   server key inside the enclave at boot, or deliver it attestation-gated, so it
   never exists outside the TEE.
-- **Secret store is baked into the image** as ciphertext; re-enrolling means a
-  rebuild and a new pinned digest. A GCS-backed store behind the same `store.Store`
-  interface removes that coupling.
+- **`store.json` is baked into the image** as ciphertext. Re-enrolling or
+  replacing a secret means restaging the store, rebuilding, pushing, and repinning
+  a new image digest. A GCS-backed store behind the same `store.Store` interface
+  would remove that coupling.
 
 ## Security note
 

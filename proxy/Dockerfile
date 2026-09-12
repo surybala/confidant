@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # SPDX-License-Identifier: Apache-2.0
 #
 # Reproducible image for confidant-proxy, targeting GCP Confidential Space.
@@ -7,26 +8,29 @@
 # pin every version.
 
 # ---- build the broker (static, CGO-off) ----
-FROM golang:1.22-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS build
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 WORKDIR /src
 COPY . .
 ENV CGO_ENABLED=0 GOFLAGS=-trimpath
-RUN go build -ldflags="-s -w" -o /out/confidant-proxy .
+RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" go build -ldflags="-s -w" -o /out/confidant-proxy .
 
 # ---- fetch a pinned Tailscale (userspace daemon + CLI) ----
-FROM debian:bookworm-slim AS tailscale
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS tailscale
 ARG TS_VERSION=1.78.1
-ARG TS_ARCH=amd64
-ADD https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_${TS_ARCH}.tgz /tmp/ts.tgz
+ARG TARGETARCH=amd64
+ADD https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_${TARGETARCH}.tgz /tmp/ts.tgz
 RUN tar -xzf /tmp/ts.tgz -C /tmp && \
     mkdir -p /ts && \
-    cp /tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscaled /ts/tailscaled && \
-    cp /tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscale  /ts/tailscale
+    cp /tmp/tailscale_${TS_VERSION}_${TARGETARCH}/tailscaled /ts/tailscaled && \
+    cp /tmp/tailscale_${TS_VERSION}_${TARGETARCH}/tailscale  /ts/tailscale
 
 # ---- final image ----
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+LABEL "tee.launch_policy.allow_env_override"="KMS_KEY,WIF_AUDIENCE,KMS_SERVICE_ACCOUNT,EGRESS_ALLOW,SECRET_STORE,TLS_CERT,TLS_KEY,CLIENT_CA,TS_AUTHKEY,TS_HOSTNAME,TS_TAGS" \
+      "tee.launch_policy.log_redirect"="always"
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /out/confidant-proxy /usr/local/bin/confidant-proxy
 COPY --from=tailscale /ts/tailscaled /usr/local/bin/tailscaled
 COPY --from=tailscale /ts/tailscale /usr/local/bin/tailscale
@@ -34,5 +38,4 @@ COPY --from=tailscale /ts/tailscale /usr/local/bin/tailscale
 # before building to ship it at /deploy/store.json (it holds only KMS ciphertext);
 # then set tee-env-SECRET_STORE=/deploy/store.json. Or mount the store another way.
 COPY deploy/ /deploy/
-RUN chmod +x /deploy/entrypoint.sh
 ENTRYPOINT ["/deploy/entrypoint.sh"]

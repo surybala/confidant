@@ -24,7 +24,8 @@ func TestGCPSetupGuideNarrowsWIFPolicy(t *testing.T) {
 		"assertion.google_service_accounts",
 		"assertion.submods.container.env['KMS_KEY']",
 		"assertion.submods.container.env['WIF_AUDIENCE']",
-		"/attribute.image_digest/sha256:IMAGE_DIGEST",
+		`export IMAGE_DIGEST="${IMAGE_REF##*@}"`,
+		"/attribute.image_digest/${IMAGE_DIGEST}",
 	} {
 		if !strings.Contains(readme, want) {
 			t.Fatalf("README WIF policy is missing %q", want)
