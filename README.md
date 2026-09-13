@@ -22,6 +22,9 @@ isolated (the broker's tree is part of its trusted computing base):
 - [docs/phase1-secrets-broker.md](docs/phase1-secrets-broker.md) — the Phase-1 architecture, threat model, and milestones.
 - [docs/broker-core.md](docs/broker-core.md) — `confidant-proxy`: security/config decisions, auth scheme, invariants (I-B*), tests.
 - [docs/local-agent.md](docs/local-agent.md) — `confidant-agent`: security/config decisions, auth scheme, invariants (I-A*), tests.
+- [docs/phase2-confidential-actions.md](docs/phase2-confidential-actions.md) — Phase-2 split-spec index.
+- [docs/phase2-runner-core.md](docs/phase2-runner-core.md) — production-grade, provider-neutral core runner/proxy/skill-host spec.
+- [confidant-skills/payments/pay_invoice/SPEC.md](confidant-skills/payments/pay_invoice/SPEC.md) — Stripe test-mode invoice-payment skill.
 
 ## Status
 
