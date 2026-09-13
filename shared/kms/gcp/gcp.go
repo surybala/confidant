@@ -38,7 +38,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/surybala/confidant/proxy/internal/kms"
+	"github.com/surybala/confidant/shared/kms"
 )
 
 // Default Google endpoints. Overridable via options for tests/staging.

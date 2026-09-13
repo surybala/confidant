@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/surybala/confidant/proxy/internal/kms"
+	"github.com/surybala/confidant/shared/kms"
 )
 
 // mockGoogle stands in for STS, IAM Credentials, and Cloud KMS. The mock "KEK"

@@ -12,3 +12,7 @@
 module github.com/surybala/confidant/proxy
 
 go 1.22
+
+require github.com/surybala/confidant/shared v0.0.0
+
+replace github.com/surybala/confidant/shared => ../shared
