@@ -14,7 +14,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/surybala/confidant/proxy/internal/kms"
+	"github.com/surybala/confidant/shared/kms"
 	"github.com/surybala/confidant/proxy/internal/policy"
 )
 

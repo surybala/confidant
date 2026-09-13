@@ -1,32 +1,46 @@
 # Confidant — Local Agent Spec
 
-**Component:** `confidant-agent` · **Phase:** 1 · **Version:** 0.1 · **Date:** 2026-09-06
+**Component:** `confidant-agent` · **Phase:** 1 plus Phase 2 local query bridge · **Version:** 0.2 · **Date:** 2026-09-13
 **Parent spec:** [phase1-secrets-broker.md](./phase1-secrets-broker.md) · **Peer:** [broker-core.md](./broker-core.md)
 
-The agent is the local, **secretless** side. It runs a loopback forward proxy that
-tools point at, recognizes credential *refs* in outbound requests to configured
-hosts, and relays those requests to the broker over mTLS. It holds no long-lived
-secret and never talks to an upstream API itself.
+The agent is the local, **secretless** side. It supports three modes:
 
-If a single sentence has to survive: **the agent only ever handles refs, only MITMs
-the hosts it is told to, tunnels everything else blind, and fails closed rather than
-leak a real key.**
+```text
+confidant-agent serve
+confidant-agent query invoke <query_id> --input '{...}'
+confidant-agent mcp
+```
+
+`serve` is the Phase 1 loopback forward proxy that tools point at. It recognizes
+credential *refs* in outbound requests to configured hosts and relays those requests to
+the broker over mTLS. `query invoke` and `mcp` are Phase 2 read-only query entrypoints
+that call the trusted runner directly over mTLS/tailnet. The agent holds no long-lived
+third-party secret and never talks to upstream provider APIs itself.
+
+If a single sentence has to survive: **the agent is the local secretless bridge: proxy
+mode handles refs, query and MCP modes call the trusted runner, and every path fails
+closed rather than leaking a real key.**
 
 ---
 
 ## 1 · Responsibilities
 
-1. Run a **loopback-only** HTTP CONNECT forward proxy (the standard `HTTPS_PROXY` target).
+1. Run a **loopback-only** HTTP CONNECT forward proxy in `serve` mode (the standard `HTTPS_PROXY` target).
 2. For **intercepted hosts**: MITM-terminate the tool's TLS with a leaf cert from a local CA, read the plaintext request.
 3. **Recognize the credential ref** in the request (see §6), strip it, and note where it was.
 4. **Relay** the reconstructed request + `ref` + `caller` metadata to the broker over a warm mTLS connection.
 5. Return the broker's response to the tool **verbatim** (streaming preserved).
 6. For **non-intercepted hosts**: **blind CONNECT tunnel** — never decrypt, never inspect.
-7. Maintain the warm mTLS connection (reconnect/backoff, health) and the local trust material.
+7. Maintain warm mTLS clients (reconnect/backoff, health) and the local trust material.
 8. Capture best-effort `caller` metadata (pid/exe) for the audit trail.
+9. Run `query invoke` as the direct human/CI path to the Phase 2 runner's
+   `/v1/queries/{query_id}` API.
+10. Run `mcp` as the local MCP bridge for Codex and other agents, exposing focused
+    read-only tools backed by the runner query API.
 
 **Not the agent's job:** holding secrets, making upstream API calls, deciding
-injection scheme, authorizing spend. Those all live in the broker.
+injection scheme, authorizing spend, or interpreting private connector data. Credential
+injection lives in the broker/proxy; private query logic lives in the runner skills.
 
 ---
 
@@ -52,6 +66,9 @@ injection scheme, authorizing spend. Those all live in the broker.
 - Non-intercepted hosts are tunneled blind: the agent never terminates their TLS, generates no leaf cert, and sees only `CONNECT host:443`. (Invariant I-A3.) This keeps the agent out of the path of traffic it has no business reading.
 - The agent **does not** connect to any upstream API. For intercepted hosts the only outbound connection it makes is the mTLS channel to the broker. (Invariant I-A4.)
 - The agent logs metadata only — never request/response bodies, never the ref's optional hint suffix, never header values beyond what's needed to route.
+- In `query invoke` and `mcp` modes, the agent does not use the MITM CA, `HTTPS_PROXY`,
+  or `cfdt:` refs. It sends selector JSON to the runner and receives only declassified
+  schema output.
 
 **Broker trust & connectivity**
 - **Connectivity is private, over Tailscale.** The agent reaches the broker only across the tailnet — the broker has **no public address**. The agent runs as a `tag:confidant-agent` node and addresses the broker by MagicDNS (e.g. `confidant-broker.<tailnet>.ts.net`). If the tailnet is unavailable, intercepted requests **fail closed**; there is no public fallback. (Invariant I-A12, consistent with I-A5.)
@@ -72,6 +89,12 @@ endpoint    = "https://confidant-broker.<tailnet>.ts.net:8443"
 client_cert = "~/.config/confidant/agent.pem"   # device identity (mTLS)
 server_spki_pin = "sha256/…"                     # broker cert pin (2nd gate)
 
+[runner]
+# Phase 2 read-only query runner. Uses the same local device identity and pinning model.
+endpoint    = "https://confidant-runner.<tailnet>.ts.net:8444"
+client_cert = "~/.config/confidant/agent.pem"
+server_spki_pin = "sha256/…"
+
 [proxy]
 listen = "127.0.0.1:8317"
 # hosts to MITM + route; everything else is blind-tunnelled
@@ -90,7 +113,7 @@ intercept = ["api.openai.com", "*.amazonaws.com", "api.github.com"]
 ```
 
 - **Trust material paths**: `client_cert`, and CA at `~/.config/confidant/ca.pem` (+ key `0600`), generated on first run.
-- **Timeouts / pool**: broker connect timeout, request timeout (must exceed broker `UPSTREAM_TIMEOUT`), max multiplexed streams.
+- **Timeouts / pool**: broker and runner connect timeouts, request timeouts, max multiplexed streams.
 - **Reload**: config is reloadable without dropping the warm connection (SIGHUP / file-watch).
 
 ---
@@ -101,6 +124,7 @@ intercept = ["api.openai.com", "*.amazonaws.com", "api.github.com"]
 |---|---|---|
 | tool → agent | none (local); agent presents a **leaf cert** signed by the name-constrained local CA | the tool's TLS validates because the CA is in the user trust store |
 | agent → broker | **mTLS over Tailscale** — enrolled device client cert, broker server cert **pinned**, across the tailnet | two gates: Tailscale (agent is a `tag:confidant-agent` node) + mTLS. The agent's only outbound auth; no public route to the broker |
+| agent → runner | **mTLS over Tailscale** — enrolled device client cert, runner server cert **pinned**, across the tailnet | used by `query invoke` and `mcp`; caller identity remains audit metadata only |
 | caller identity | best-effort OS lookup (local port → pid → exe) | advisory metadata only, not used for any decision |
 
 Phase 1 deliberately does **not** authenticate individual local callers: any local
@@ -131,6 +155,32 @@ and forwards the *unsigned canonical* request + ref. The broker re-signs with th
 real key (SigV4). See broker-core.md §6.
 
 **Non-intercepted host:** `CONNECT host:443` → blind TCP tunnel, agent never decrypts.
+
+**Read-only query path:**
+```
+human / Codex ──▶ confidant-agent query invoke OR confidant-agent mcp
+  agent: validate local command/tool envelope
+  agent: capture caller metadata
+  agent ──mTLS/tailnet──▶ runner   POST /v1/queries/{query_id}
+  runner: executes measured read-only skill
+  agent ◀── declassified schema result ── runner
+human / Codex ◀── result
+```
+
+`query invoke` and `mcp` do not route through the loopback proxy, do not MITM local TLS,
+and do not use `cfdt:` refs. They share the same secretless runner client library.
+
+**MCP mode:** `confidant-agent mcp` fetches the runner's public query catalog at startup
+and exposes one focused read-only MCP tool per enabled runner query. Tool names,
+descriptions, and JSON schemas come from that catalog. A generic arbitrary query tool is
+not exposed by default, and the catalog is not authority: every tool call still goes back
+to `POST /v1/queries/{query_id}` for runner-side validation.
+
+For the first Phase 2 demo, the catalog exposes a focused tool for
+`github.repo_security_brief.v1`. Codex can answer "check my private repo security
+posture" by passing the current repository owner/name as a selector. The runner validates
+that selector against configured repository authorization before any GitHub egress and
+returns only the declassified security brief.
 
 **Broker error mapping:** the broker's structured error becomes an HTTP response the
 tool's SDK understands — e.g. broker `403` (policy) → a `403` to the tool with a
@@ -169,6 +219,11 @@ Rules:
 - **I-A10** `caller` metadata is best-effort and advisory; the agent never blocks or authorizes on it.
 - **I-A11** Refs' `#hint` suffixes and all request/response bodies are never written to logs.
 - **I-A12** The agent reaches the broker only over the tailnet (private, no public route); if the tailnet is down, intercepted requests fail closed and non-intercepted traffic is unaffected.
+- **I-A13** `query invoke` and `mcp` reach the runner only over the tailnet with pinned mTLS.
+- **I-A14** `query invoke` and `mcp` do not use the transparent proxy/MITM path and never
+  accept or forward local credential refs.
+- **I-A15** MCP tools exposed by the agent are read-only, schema-bound, and backed by
+  measured runner queries.
 
 ---
 
@@ -179,6 +234,10 @@ Rules:
 - Reject paths: unknown ref, non-`cfdt:` value on intercepted host.
 - CA generation produces a **name-constrained** cert; assert it cannot sign a leaf for an out-of-list domain.
 - Broker error → tool-facing HTTP mapping table.
+- Query client builds `POST /v1/queries/{query_id}` requests with caller metadata and uses
+  pinned mTLS/tailnet runner config.
+- MCP mode fetches the public runner query catalog, exposes one read-only tool per enabled
+  query, and rejects arbitrary query ids by default.
 
 ### Integration (agent + mock broker + real tool client)
 - **T-A1 Happy path:** `curl`/SDK with `HTTPS_PROXY=127.0.0.1:8317` to an intercepted host with a ref → agent forwards to mock broker, response returned verbatim. *(I-A1, I-A4)*
@@ -194,6 +253,10 @@ Rules:
 - **T-A11 Config reload:** add an intercept host via SIGHUP without dropping the warm connection. 
 - **T-A12 Log hygiene:** run T-A1 and assert logs contain no body bytes and no `#hint` value. *(I-A11)*
 - **T-A13 Tailnet down → fail closed:** simulate the tailnet being unreachable → intercepted requests fail closed with a clear error; a concurrent non-intercepted request still tunnels fine. *(I-A12)*
+- **T-A14 Query invoke:** `confidant-agent query invoke` calls a mock runner directly and
+  prints only the declassified result; it does not start or use the loopback proxy.
+- **T-A15 MCP bridge:** Codex-compatible MCP client lists the read-only Confidant tools,
+  invokes one against a mock runner, and receives only schema output.
 
 ---
 

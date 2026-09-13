@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/surybala/confidant/proxy/internal/audit"
-	"github.com/surybala/confidant/proxy/internal/kms"
+	"github.com/surybala/confidant/shared/kms"
 	"github.com/surybala/confidant/proxy/internal/policy"
 	"github.com/surybala/confidant/proxy/internal/store"
 	"github.com/surybala/confidant/proxy/internal/wire"
