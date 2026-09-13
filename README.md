@@ -12,7 +12,7 @@ isolated (the broker's tree is part of its trusted computing base):
 | Path | Binary | Role | Runs |
 |---|---|---|---|
 | [`proxy/`](proxy/) | `confidant-proxy` | **Broker core** — the credential-injecting egress proxy. The only place a plaintext secret exists. | GCP Confidential Space enclave |
-| [`agent/`](agent/) | `confidant-agent` | **Local agent** — loopback forward proxy; secretless; relays intercepted calls to the broker. | Your machine |
+| [`agent/`](agent/) | `confidant-agent` | **Local agent** — secretless local interface. Phase 1 `serve` is the loopback forward proxy; Phase 2 adds `query invoke` and `mcp`. | Your machine |
 
 > **Naming:** `confidant-proxy` is the enclave-side broker ([broker-core.md](docs/broker-core.md));
 > `confidant-agent` is the local side ([local-agent.md](docs/local-agent.md)).
@@ -22,9 +22,10 @@ isolated (the broker's tree is part of its trusted computing base):
 - [docs/phase1-secrets-broker.md](docs/phase1-secrets-broker.md) — the Phase-1 architecture, threat model, and milestones.
 - [docs/broker-core.md](docs/broker-core.md) — `confidant-proxy`: security/config decisions, auth scheme, invariants (I-B*), tests.
 - [docs/local-agent.md](docs/local-agent.md) — `confidant-agent`: security/config decisions, auth scheme, invariants (I-A*), tests.
-- [docs/phase2-confidential-actions.md](docs/phase2-confidential-actions.md) — Phase-2 split-spec index.
-- [docs/phase2-runner-core.md](docs/phase2-runner-core.md) — production-grade, provider-neutral core runner/proxy/skill-host spec.
-- [confidant-skills/payments/pay_invoice/SPEC.md](confidant-skills/payments/pay_invoice/SPEC.md) — Stripe test-mode invoice-payment skill.
+- [docs/phase2-confidential-actions.md](docs/phase2-confidential-actions.md) — Phase-2 read-only confidential query index.
+- [docs/phase2-runner-core.md](docs/phase2-runner-core.md) — V1 read-only, provider-neutral core runner/proxy/skill-host spec.
+- [confidant-skills/github/repo_security_brief/SPEC.md](confidant-skills/github/repo_security_brief/SPEC.md) — first Phase-2 read-only demo: private repository security posture.
+- [confidant-skills/payments/pay_invoice/SPEC.md](confidant-skills/payments/pay_invoice/SPEC.md) — deferred Stripe test-mode invoice-payment skill design.
 
 ## Status
 
@@ -32,10 +33,16 @@ Phase-1 **functional**, stdlib-only (builds offline, no dependencies). Both the
 local **dev** path and the GCP **enclave** unwrap path are implemented; see
 [Running for real](#running-for-real) to use the enclave broker.
 
-- **`confidant-agent`** — a real loopback CONNECT proxy: blind-tunnels
+- **`confidant-agent`** — a real loopback CONNECT proxy today: blind-tunnels
   non-intercepted hosts, and for intercepted hosts MITM-terminates with a
   name-constrained local CA, detects the inert `cfdt:` ref, strips the credential,
   and relays to the broker over SPKI-pinned mTLS. Fails closed throughout.
+  Phase 2 design keeps this binary as the local entrypoint and adds direct
+  read-only runner query modes: `confidant-agent query invoke` and
+  `confidant-agent mcp`. The first planned Phase 2 demo is
+  `github.repo_security_brief.v1`, which lets Codex ask for a private repository
+  security posture brief without receiving raw GitHub security-alert payloads or
+  GitHub credentials.
 - **`confidant-proxy`** — the real `/v1/proxy` pipeline: resolve ref → authorize
   (before unwrap) → unwrap the secret → apply the static credential module →
   HTTPS-only egress-allowlisted upstream call → scrub → hash-chained audit. mTLS

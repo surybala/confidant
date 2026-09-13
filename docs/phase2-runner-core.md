@@ -1,41 +1,49 @@
 # Confidant - Phase 2 Core Runner
 
-**Status:** Draft for build — scoped to a single-resource, synchronous side effect  
-**Version:** 0.2  
-**Date:** 2026-09-12  
-**Parent:** [phase1-secrets-broker.md](./phase1-secrets-broker.md)  
-**Example skill:** [pay_invoice](../confidant-skills/payments/pay_invoice/SPEC.md)
+**Status:** Draft for build - V1 read-only confidential query runner
+**Version:** 0.3
+**Date:** 2026-09-13
+**Parent:** [phase1-secrets-broker.md](./phase1-secrets-broker.md)
+**First demo skill:** [github.repo_security_brief](../confidant-skills/github/repo_security_brief/SPEC.md)
 
-Phase 2 adds a minimal trusted execution layer for business actions. Local code stays
-untrusted. It can name an action and provide selectors, but a measured enclave validates
-the request against private authoritative state, standing authorization, durable
-idempotency, and declassification policy before any side effect happens.
+Phase 2 V1 adds the smallest useful trusted execution layer: a measured runner for
+read-only confidential queries. Local code stays untrusted. It can name a query and
+provide selectors, but a measured enclave validates the request, fetches private data
+through declared read-only connectors, and returns only schema-bounded declassified
+output.
 
-The core design goal is that `confidant-agent`, `confidant-runner`, and
-`confidant-proxy` stay small, stable, and provider-neutral. Payments, refunds, cloud
-remediation, trading, and other workflows are trusted skills, not core modules.
+V1 deliberately avoids side effects. That removes operation ledgers, idempotency keys,
+locks, provider idempotency material, and crash reconciliation from the critical path.
+The design goal is simple, secure, and minimal.
 
-If one sentence has to survive: **the core hosts measured skills and enforces the
-boundaries; skills contain the business logic.**
+If one sentence has to survive: **the runner executes measured read-only skills and
+enforces connector scope plus declassification; skills contain the private business
+logic.**
 
 ---
 
 ## 1. Scope
 
-This spec defines the production-grade core runner and its hooks:
+This spec defines the Phase 2 V1 core runner:
 
-- agent-to-runner action API
-- measured trusted-skill registry
+- `confidant-agent` to runner query API
+- measured trusted-query skill registry
 - runner host services exposed to skills
-- proxy-backed connector interface
-- durable operation state
-- runner-derived idempotency, audit, and declassification
+- sealed-source reads
+- proxy-backed read-only connector calls
+- schema-bounded declassification
+- audit and redaction
 - runner-to-proxy internal egress
 - deployment, attestation, network, and test gates
 
-This spec does **not** define a concrete payment rail, provider schema, invoice schema,
-or transaction format. Those belong in a skill module, such as
-[`confidant-skills/payments/pay_invoice`](../confidant-skills/payments/pay_invoice/SPEC.md).
+This spec does **not** define side-effecting actions. Payments, refunds, cloud
+remediation, trading, ticket updates, email sends, or any other mutation are deferred
+until a later side-effect phase.
+
+First V1 demo: `github.repo_security_brief.v1`, a private repository security posture
+brief. Codex can invoke it from a natural prompt, the runner reads only fixed GitHub
+security-alert endpoints through the proxy, and the local caller receives only a
+schema-bounded prioritized brief.
 
 ---
 
@@ -43,33 +51,30 @@ or transaction format. Those belong in a skill module, such as
 
 **Goals**
 
-- Keep private business data, connector responses, credentials, wallet auth material,
-  and intermediate reasoning out of the local environment.
-- Keep core modules minimal: stable protocol, policy, attestation, state, credential,
+- Keep private business data, connector responses, credentials, auth material, and
+  intermediate reasoning out of the local environment.
+- Keep core modules minimal: stable protocol, policy, attestation, read connector,
   audit, and declassification machinery only.
-- Let untrusted local agents trigger pre-authorized side effects through narrow,
-  measured trusted-skill actions.
-- Make every trusted unit reproducible, measured, and pinned by attestation.
-- Require every action to declare what it may read, call, change, persist, and return.
-- Support unattended autonomous actions without per-transaction confirmation, but only
-  when every consequential field is authoritatively determined and exposure is bounded by
-  standing authorization.
-- Make state and audit durable enough that retries, races, crashes, and replay attempts do
-  not cause duplicate side effects.
-- Allow many use cases to be added as skills without expanding the trusted core or
-  weakening the existing invariants.
+- Let untrusted local agents trigger pre-reviewed read-only queries through narrow,
+  measured trusted-skill code.
+- Make every trusted query reproducible, measured, and pinned by attestation.
+- Require every query to declare what it may read, call, inspect, persist, and return.
+- Keep the proxy as the only credentialed egress component.
+- Make all local outputs schema-bounded, byte-bounded, and explicitly declassified.
+- Allow later side-effecting actions to reuse the registry, connector, audit, and
+  declassification machinery without complicating V1.
 
 **Non-goals**
 
-- Running arbitrary caller-supplied code in the enclave.
+- Any mutation or externally visible side effect.
+- Running arbitrary caller-supplied code, query languages, scripts, SQL, GraphQL, or
+  provider SDK workflows chosen by the caller.
 - Importing provider SDKs or business workflows into `confidant-agent`,
   `confidant-runner`, or `confidant-proxy`.
 - Making the local agent honest. It remains adversarial.
-- Offering a confirmation gate for non-determinable actions. If recipient, amount, target,
-  or other consequential fields cannot be determined from authoritative sources, the
-  action is not admissible.
-- Replacing provider-native controls. Provider policies, limits, approvals, and spend
-  permissions are defense in depth.
+- Durable operation ledgers, idempotency, locks, provider idempotency keys, or crash
+  reconciliation.
+- Aggregate spend caps or multi-resource coordination.
 - Local filesystem sandboxing for untrusted tools. That remains a separate phase.
 
 ---
@@ -81,8 +86,8 @@ an agent plugin, dependency, MCP tool, generated script, or compromised CLI.
 
 The adversary can:
 
-- call the local Confidant agent
-- choose action ids and action inputs
+- call the local Confidant agent or CLI
+- choose query ids and query inputs
 - retry, race, and replay requests
 - inspect local env vars, dotfiles, logs, and process memory
 - attempt prompt injection against the local agent
@@ -91,18 +96,20 @@ The adversary can:
 The adversary should not be able to:
 
 - read connector credentials or auth material
-- read private connector responses unless explicitly declassified
-- modify skill policy, egress, code, schema, or output policy at request time
-- trigger side effects outside a measured skill manifest and proxy credential policy
-- bypass idempotency or approval gates by retrying
+- read raw private connector responses unless explicitly declassified
+- modify skill policy, egress, code, schema, connector scope, or output policy at
+  request time
+- trigger write, mutate, send, create, update, delete, confirm, execute, or submit
+  operations through the V1 runner
 - cause raw provider responses or sensitive intermediate state to return locally
+- bypass output policy by selecting alternate fields, formats, or response sizes
 
 Out of scope:
 
 - compromise of reviewed trusted skill code itself
 - malicious authoritative systems returning false records
 - provider compromise
-- hiding public side effects from public networks
+- hiding the fact that a read request reached a provider from the provider
 - side-channel resistance beyond the Confidential Space threat model
 
 ---
@@ -113,37 +120,36 @@ Out of scope:
 LOCAL MACHINE (untrusted)                 GCP CONFIDENTIAL SPACE (trusted)
 +----------------------+                  +------------------------------------+
 | coding agent / tool  |                  | runner pool                        |
-| chooses selectors    |                  | +------------------------------+   |
+| chooses query+input   |                  | +------------------------------+   |
 +----------+-----------+                  | | confidant-runner             |   |
-           |                              | | skill host + state + audit   |   |
+           |                              | | read skill host + audit      |   |
            v                              | +---------------+--------------+   |
 +----------------------+ mTLS + tailnet   |                 | internal egress   |
-| confidant-agent      +----------------->|                 v                  |
-| local, secretless    |                  | +------------------------------+   |
+| confidant-agent       +----------------->|                 v                  |
+| serve/query/mcp       |                  | +------------------------------+   |
 +----------^-----------+                  | | confidant-proxy              |   |
            |                              | | credentialed egress broker   |   |
-           |                              | +-------+-----------+----------+   |
-           |                              +---------|-----------|--------------+
-           |                                        |           |
-           |                                        v           v
-           |                                  SaaS APIs     payment/cloud/etc.
-           |                                        |           |
-           +-------- declassified output <----------+-----------+
+           |                              | +-------+----------------------+   |
+           |                              +---------|--------------------------+
+           |                                        |
+           |                                        v
+           |                                  SaaS/read APIs
+           |                                        |
+           +-------- declassified output <----------+
 ```
 
 | Component | Runs | Responsibility | Sees private data? | Sees credentials? |
 |---|---|---|---|---|
-| `confidant-agent` | Local | Authenticates to runner, forwards action calls, returns declassified outputs | No | No |
-| `confidant-runner` | Enclave | Minimal trusted-skill host; validates action envelopes; provides state, audit, connector calls, and output validation | Yes | No |
+| `confidant-agent` | Local | Secretless local binary with `serve`, `query invoke`, and `mcp` modes | No | No |
+| `confidant-runner` | Enclave | Minimal read-skill host; validates envelopes; provides sealed-source reads, read connector calls, audit, and output validation | Yes | No |
 | `confidant-proxy` | Enclave | Minimal credentialed egress broker; unwraps/mints/signs/injects credentials; enforces declarative credential and delegation policy | Provider responses in transit | Yes, ephemeral |
-| `confidant-skills` bundles | Compiled into the runner image (build-time registry) | Trusted recipes with provider schemas, connector adapters, business logic, policy templates, and tests | Yes | No |
-| Runner state bucket | Cloud Storage | Operation logs, receipts, capability snapshots, directory snapshots, audit | Metadata and declassified receipts; app-sealed/MACed | No |
+| `confidant-skills` bundles | Compiled into the runner image | Trusted read recipes with provider schemas, parsing, private logic, output construction, tests, and fixtures | Yes | No |
+| Runner audit/state bucket | Cloud Storage | Audit, optional immutable query records, capability snapshots, directory snapshots | Metadata and declassified outputs; app-sealed/MACed where app-owned | No |
 | Credential store | Proxy-controlled | Sealed credentials plus credential/delegation policy | Policy metadata | Ciphertext at rest |
 
 The core modules deliberately do not import provider SDKs or encode provider workflows.
-The runner hosts measured skills. The proxy performs generic credentialed egress. Skills
-contain business-specific parsing, validation, transaction construction, and provider
-request shaping.
+The runner hosts measured read skills. The proxy performs generic credentialed egress.
+Skills contain business-specific parsing, validation, and result construction.
 
 ---
 
@@ -151,41 +157,41 @@ request shaping.
 
 `confidant-agent` owns:
 
-- local authenticated forwarding to the runner
+- local authenticated forwarding to the runner for query and MCP modes
+- Phase 1 transparent proxy serving for existing credentialed API calls
 - caller metadata collection for audit only
 - returning declassified outputs
 - no secret handling and no business authorization
 
 `confidant-runner` owns:
 
-- agent authentication and action routing
+- agent authentication and query routing
 - measured skill registry and digest allowlist
 - input envelope validation and canonicalization hooks
 - static manifest authorization
-- durable operation keys, receipts, and audit
-- state record sealing/MAC verification
-- sealed-source reads and proxy-backed egress connector invocation
+- sealed-source reads
+- proxy-backed read connector invocation
 - output schema validation and max-byte enforcement
-- panic hygiene, constant denial, and declassification boundary
+- panic hygiene, constant denial, redaction, and declassification boundary
+- query audit and optional immutable query records
 
 `confidant-proxy` owns:
 
 - credential unwrap and DEK handling
 - static, signed, and OAuth credential primitives
-- credential policy and runner/action delegation policy
+- credential policy and runner/query/role delegation policy
 - host, method, path, endpoint-shape, and evidence checks
 - egress allowlist, TLS validation, optional pinning
 - credential scrubbing and credential-use audit
 
-`confidant-skills` owns, per trusted recipe:
+`confidant-skills` owns, per trusted read recipe:
 
+- input and output schemas
 - provider request/response schemas
 - connector adapters over the runner connector interface
 - private response parsing
 - business policy
-- authoritative determination of consequential fields
-- provider transaction/request construction
-- receipt construction and proposed declassified fields
+- result construction and proposed declassified fields
 - skill-specific tests and fixtures
 
 Core dependency rule: core packages may depend on standard runtime libraries and generic
@@ -194,127 +200,210 @@ are allowed only under `confidant-skills/*`.
 
 ---
 
-## 6. Trusted Skill Model
+## 6. Trusted Query Skill Model
 
-A trusted skill bundle exports one or more actions. Each action has a manifest pinned by
-digest:
+A trusted skill bundle exports one or more read-only queries. Each query has a manifest
+pinned by digest:
 
 ```json
 {
-  "id": "example.action.v1",
-  "kind": "trusted_skill_action",
+  "id": "example.lookup.v1",
+  "kind": "trusted_query",
   "skill_bundle": "confidant-skills/example",
   "skill_version": "0.1.0",
   "skill_digest": "sha256:<pinned skill bundle digest>",
-  "input_schema": "ExampleSelector",
-  "output_schema": "ExampleReceipt",
+  "input_schema": "ExampleLookupSelector",
+  "output_schema": "ExampleLookupView",
   "authoritative_bindings": {
-    "target": { "source": "authoritative-system/prod", "key": "selector.id" },
-    "amount": { "source": "record.balance" },
-    "eligibility": ["record.exists", "record.status == 'approved'"]
+    "record": { "source": "authoritative-system/prod", "key": "selector.id" },
+    "eligibility": ["record.exists", "caller may learn this view"]
   },
   "connectors": [
-    { "id": "authoritative-system/prod", "kind": "egress", "role": "source", "scopes": ["read"] },
-    { "id": "effect-rail/prod", "kind": "egress", "role": "effect", "scopes": ["mutate"] }
+    {
+      "id": "authoritative-system/prod",
+      "kind": "egress",
+      "role": "source",
+      "scopes": ["read"]
+    }
   ],
   "egress": {
     "allow_hosts": ["api.example.com"],
-    "allow_methods": ["GET", "POST"]
+    "allow_methods": ["GET", "HEAD"],
+    "allow_paths": ["/v1/records/*"]
   },
-  "side_effects": [
-    { "kind": "example_effect", "max_amount_usd": "250.00" }
-  ],
   "declassify": {
     "mode": "schema",
-    "schema": "ExampleReceipt",
+    "schema": "ExampleLookupView",
     "max_bytes": 4096,
     "residual_leak": "<declared residual>"
   },
   "limits": {
-    "timeout_ms": 20000,
-    "rpm": 10
+    "timeout_ms": 10000,
+    "rpm": 30,
+    "max_connector_response_bytes": 1048576
   }
 }
 ```
 
-The manifest, schema hashes, connector roles, side-effect declarations, output schema, and
-skill digest are part of the runner measured allowlist. A caller can select only an action
-id. It cannot choose code, a skill bundle, connector scope, egress host, output policy, or
-declassification mode.
+The manifest, schema hashes, connector roles, output schema, declassification policy,
+and skill digest are part of the runner measured allowlist. A caller can select only a
+query id. It cannot choose code, a skill bundle, connector scope, egress host, output
+policy, or declassification mode.
 
-Each connector declares a `kind`: `sealed_source` (measured fixtures or signed
-directory/capability snapshots, read locally through `ActionContext`) or `egress` (a
-credentialed call brokered by the proxy). Only `egress` connectors carry an egress host,
-and only they reach the network.
+Each connector declares a `kind`:
+
+- `sealed_source`: measured fixtures or signed directory/capability snapshots, read
+  locally through `QueryContext`
+- `egress`: credentialed read call brokered by the proxy
+
+Only `egress` connectors carry egress host/path declarations, and only they reach the
+network.
+
+### V1 Read-Only Rule
+
+V1 egress supports `GET` and `HEAD` only. Endpoint allowlists are still required because
+method alone is not a complete read-only guarantee. APIs that require `POST` for
+read-only search, GraphQL, export jobs, or async reports are deferred until the runner has
+explicit endpoint-level read semantics and stronger response controls.
 
 ### Skill Interface
 
-Each skill action implements the runner host interface:
+Each query implements the runner host interface:
 
 ```go
-type Action interface {
+type Query interface {
     ID() string
     Manifest() Manifest
     ValidateInput(json.RawMessage) (CanonicalInput, error)
-    Plan(ctx ActionContext, in CanonicalInput) (Plan, error)
-    Execute(ctx ActionContext, plan Plan) (Receipt, error)
-    Declassify(receipt Receipt) (json.RawMessage, error)
+    Run(ctx QueryContext, in CanonicalInput) (QueryResult, error)
+    Declassify(result QueryResult) (json.RawMessage, error)
 }
 ```
 
-`ActionContext` is a capability object, not a general runtime. It exposes only:
+`QueryContext` is a capability object, not a general runtime. It exposes only:
 
-- declared egress connector calls through the proxy-backed connector interface
-- declared sealed-source reads (measured fixtures and signed directory/capability
-  snapshots) — local, never egress
-- durable operation/event APIs
-- receipt write/read APIs
-- audit APIs
-- bounded time and randomness helpers
+- declared read-only egress connector calls through the proxy-backed connector interface
+- declared sealed-source reads
+- audit helpers
+- bounded time helpers
 - manifest, schema, and capability metadata
 
-It must not expose raw network clients, filesystem authority, process spawning,
-environment variables, plaintext credentials, or direct response streaming.
+It must not expose raw network clients, write connector methods, filesystem authority,
+process spawning, environment variables, plaintext credentials, direct response
+streaming to local callers, or mutation-oriented state APIs.
 
 ### Admissibility
 
-An action is admissible for autonomous execution only if:
+A query is admissible for V1 only if:
 
-- every consequential field is authoritatively determined from private trusted sources
-- worst-case side effects over all adversary-chosen selectors are within enrollment caps
-- the side effect maps to one obligation resource, so the operation key alone serializes it
+- all connector calls are read-only by declared method, host, path, scope, and proxy
+  delegation policy
+- caller input is selectors plus explicitly marked non-consequential presentation hints
+- no caller input is interpreted as a provider query language, endpoint path, projection,
+  SQL, GraphQL, script, or filter expression
 - declassification is schema-bounded and byte-bounded
-- provider-specific failure modes fail closed or resolve by a synchronous idempotent retry
+- private validation denials can be returned with a constant caller-facing code when
+  membership or eligibility leaks matter
+- connector response sizes, timeouts, and call counts are bounded
 
-If an action needs arbitrary caller-provided recipient, amount, target, or code, it is not
-registered. There is no "offer it with a confirmation" path in Phase 2. Actions that need
-multi-resource locks, a standalone effect ledger, or asynchronous reconciliation are
-deferred (see §17).
+If a use case needs mutation, arbitrary caller-provided queries, async exports, streaming
+raw data, or provider-side jobs, it is not registered in V1.
 
 ### Schemas, Bindings, And Loading
 
 - **Schemas.** `input_schema` and `output_schema` name Go structs. Input is decoded with
-  unknown-field rejection; output is built only from declared receipt fields. A canonical
-  hash of each schema is pinned in the measured allowlist, so any schema change changes the
-  measurement. The core ships no dynamic schema language.
+  unknown-field rejection; output is built only from declared result fields. A canonical
+  hash of each schema is pinned in the measured allowlist, so any schema change changes
+  the measurement. The core ships no dynamic schema language.
 - **Bindings are declarative.** `authoritative_bindings` and `eligibility` are measured,
-  human-reviewed statements of what the skill must prove. The runner does not evaluate them
-  and ships no expression engine; the skill's `Plan`/`Execute` code enforces them.
-- **Loading (v1).** Skills are compiled into the runner image and registered at build time.
-  `skill_digest` is the hash of the skill package plus its embedded sealed sources. Enabling
-  or disabling an action is a runner config flag over the registry, not a core code change.
-  Separately-loadable measured bundles are deferred (see §17).
+  human-reviewed statements of what the skill must prove. The runner does not evaluate
+  them and ships no expression engine; the skill's `Run` code enforces them.
+- **Loading.** Skills are compiled into the runner image and registered at build time.
+  `skill_digest` is the hash of the skill package plus its embedded sealed sources.
+  Enabling or disabling a query is a runner config flag over the registry, not a core
+  code change. Separately-loadable measured bundles are deferred.
 
 ---
 
-## 7. Request And Response Contract
+## 7. Local Agent Modes
 
-Agent-to-runner request:
+V1 uses one local binary with three modes:
+
+```text
+confidant-agent serve
+confidant-agent query invoke <query_id> --input '{...}'
+confidant-agent mcp
+```
+
+All three modes share the same local configuration root and trust material:
+
+- runner/broker tailnet endpoint
+- device client certificate and key for mTLS
+- runner/broker SPKI pin
+- caller metadata collection
+- timeouts and retry policy
+
+`serve` is the Phase 1 transparent proxy mode. It handles `HTTPS_PROXY`, the local
+name-constrained MITM CA, intercepted hosts, `cfdt:` refs, and forwarding to
+`confidant-proxy`.
+
+`query invoke` is the human and CI diagnostic path for Phase 2. It does not use
+`HTTPS_PROXY`, the local MITM CA, or `cfdt:` refs. It calls the runner's
+`/v1/queries/{query_id}` endpoint directly over mTLS/tailnet and prints the
+declassified result.
+
+`mcp` is the primary agent integration path. It exposes read-only MCP tools backed by the
+same direct runner client used by `query invoke`. The MCP bridge is local and secretless;
+it should expose one focused tool per enabled query, with a tool name, description, JSON
+schema, and read-only annotation. It should not expose a generic arbitrary query tool by
+default.
+
+At startup, `mcp` fetches the runner's public query catalog and maps each enabled query to
+one MCP tool. The catalog is for ergonomics only; it contains no private data, no
+credential refs, and no connector responses. The runner remains authoritative for every
+invocation and revalidates query id, input schema, manifest policy, connector scope, and
+output policy on each call.
+
+The shared implementation unit is a secretless runner client library used by both
+`query invoke` and `mcp`. The transparent proxy pipeline is separate, but it shares config
+loading, device identity, endpoint pins, and caller metadata helpers.
+
+---
+
+## 8. Request And Response Contract
+
+Public catalog request:
 
 ```json
-POST /v1/actions/{action_id}
+GET /v1/queries
+```
+
+The response is a public, measured tool catalog for local display and MCP tool
+registration:
+
+```json
 {
-  "idempotency_key": "caller-visible-key",
+  "queries": [
+    {
+      "id": "example.lookup.v1",
+      "tool_name": "confidant_example_lookup",
+      "description": "Look up the approved public view of an example record.",
+      "input_schema": { "type": "object" },
+      "read_only": true
+    }
+  ]
+}
+```
+
+The catalog must not include private data, credential refs, raw connector metadata, or
+unbounded examples. A stale or tampered local catalog cannot grant authority because
+`POST /v1/queries/{query_id}` validates the measured registry again.
+
+Query invocation request:
+
+```json
+POST /v1/queries/{query_id}
+{
   "input": {
     "selector_id": "source:12345"
   },
@@ -330,89 +419,71 @@ Rules:
 
 - `input` is selectors-only unless a field is explicitly marked non-consequential.
 - `caller` is audit metadata only and never authorizes.
-- `idempotency_key` is required for side-effecting actions, but it is not the durable
-  operation identity.
 - Unknown fields, oversize inputs, malformed selectors, consequential values, and schema
   mismatches fail before any connector call.
+- No caller-supplied idempotency key exists in V1. Read queries may include an optional
+  caller trace id later, but it is audit-only.
 
 Runner-to-agent response:
 
 ```json
 {
-  "action_id": "example.action.v1",
-  "status": "posted",
-  "receipt": {
-    "receipt_id": "rcpt_...",
+  "query_id": "example.lookup.v1",
+  "status": "ok",
+  "result": {
     "selector_id": "source:12345"
   }
 }
 ```
 
-Denials use a single constant caller-facing code for all pre-side-effect validation
-failures in an action. Specific reasons live only in enclave audit.
+Denials use a single constant caller-facing code for all private validation failures in a
+query. Specific reasons live only in enclave audit.
 
 ---
 
-## 8. Runner Pipeline
+## 9. Runner Pipeline
 
 1. Authenticate agent mTLS identity and enforce tailnet ingress.
-2. Parse action id, resolve pinned skill action, verify skill digest and manifest/schema
-   hashes against measured allowlist.
-3. Validate request size, content type, and JSON envelope.
-4. Call skill input validation and canonicalize input.
-5. Compute deterministic operation key:
-   `hash(action_id || selector || policy_hash || capability_hash || directory_hash)`.
-   The key is derived from the single obligation resource, so it doubles as the mutual
-   exclusion for that resource; no separate lock object is required.
-6. Claim the operation by creating the `reserved` event with `ifGenerationMatch=0`.
-   - If a committed receipt already exists, return it.
-   - If the claim loses the race (`412`), another attempt owns the operation: return its
-     committed receipt, or a retryable coarse error if it is still in flight.
-   - If caller idempotency is bound to different canonical input, deny.
-7. Run static manifest authorization that does not need private reads.
-8. Fetch private context through declared connector roles, let the skill run private
-   validations and determine every consequential field, then append `validated`.
-9. Verify provider-native policy or evidence when the skill declares such a precondition.
-10. Append durable `submitted`, with the stored provider idempotency material, before the
-    side-effecting provider call.
-11. Ask the proxy to call the declared effect connector using the runner-derived operation
-    context and the stored provider idempotency material.
-12. Commit the declassified `posted` receipt durably before returning success.
-13. Build output only from declared receipt fields; validate output schema, reject extra
-    fields, and enforce max bytes.
-14. Append action audit and return the declassified output or a constant denial.
+2. For `GET /v1/queries`, return the public measured query catalog.
+3. For `POST /v1/queries/{query_id}`, parse query id, resolve pinned skill query, verify skill digest and manifest/schema
+   hashes against the measured allowlist.
+4. Validate request size, content type, and JSON envelope.
+5. Call skill input validation and canonicalize input.
+6. Run static manifest authorization:
+   - query is enabled
+   - connector ids, roles, scopes, hosts, methods, and paths are measured
+   - all egress methods are V1 read methods
+   - limits are within runner maximums
+7. Construct a `QueryContext` containing only declared sealed-source and read-only egress
+   capabilities for this query invocation.
+8. Let the skill fetch private context and compute a private result.
+9. Ask the skill to declassify the result into the declared output shape.
+10. Validate output schema, reject extra fields, reject raw connector responses, and enforce
+   max bytes.
+11. Append query audit and return the declassified output.
 
-If any step fails before `submitted`, the runner audits once, discards private context, and
-returns a constant denial. If a step fails after `submitted`, the runner never blindly
-resubmits: it returns the committed receipt if present, otherwise it re-issues the exact
-stored provider request under the stored provider idempotency key and reads the provider's
-synchronous status. Because this phase targets a synchronous, provider-idempotent rail, that
-one call resolves every crash window.
+If any step fails, the runner audits once, discards private context, and returns either a
+generic transport/configuration error or the query's constant denial. No durable operation
+state is required because no side effect can occur.
 
 ---
 
-## 9. Proxy Egress Pipeline
+## 10. Proxy Read Egress Pipeline
 
-Runner-to-proxy requests include action context:
+Runner-to-proxy read requests include query context:
 
 ```json
 {
   "ref": "cfdt:provider/prod",
   "context": {
     "runner_principal": "runner:default",
-    "action_id": "example.action.v1",
-    "invocation_id": "act_abc123",
-    "connector_role": "source",
-    "operation_key": "op_...",
-    "idempotency_key": "caller-visible-key",
-    "policy_evidence": {
-      "provider_policy_id": "policy_...",
-      "provider_policy_hash": "sha256:..."
-    }
+    "query_id": "example.lookup.v1",
+    "invocation_id": "qry_abc123",
+    "connector_role": "source"
   },
   "upstream": {
     "method": "GET",
-    "url": "https://api.example.com/v1/record/12345",
+    "url": "https://api.example.com/v1/records/12345",
     "headers": { "accept": "application/json" }
   }
 }
@@ -423,111 +494,66 @@ The proxy:
 1. Authenticates runner identity from transport.
 2. Binds transport identity to `runner_principal`; rejects mismatches.
 3. Resolves `ref` to credential policy.
-4. Verifies host, method, path, endpoint shape, connector role, and declared action id.
-5. Verifies delegate policy names the runner principal, action id, and role.
-6. Verifies rate, spend, concurrency, and declarative provider-policy evidence required by
-   the credential policy.
+4. Verifies host, method, path, endpoint shape, connector role, and declared query id.
+5. Verifies delegate policy names the runner principal, query id, and role.
+6. Verifies rate, concurrency, response-size, and declarative provider-policy evidence
+   required by the credential policy.
 7. Unwraps, mints, signs, or injects credential material.
 8. Calls upstream through egress allowlist and TLS verification.
 9. Scrubs credential reflections from response metadata and errors.
 10. Appends credential-use audit.
 11. Returns upstream response only to the runner.
 
-The proxy must not parse business objects or execute provider SDK workflows. It can enforce
-declarative policy and generic credential primitives.
+The proxy must not parse business objects or execute provider SDK workflows. It can
+enforce declarative policy and generic credential primitives.
 
 ---
 
-## 10. Durable State
+## 11. State And Audit
 
-Production runner durable state lives outside the immutable image in a dedicated Cloud
-Storage bucket reachable only by the runner's attested workload identity. Local disk is not
-production authority state.
-
-State classes:
+V1 has no side-effect operation ledger. Production runner state is limited to audit,
+optional immutable query invocation records, capabilities, and directories.
 
 | State | Purpose |
 |---|---|
-| Operation events | Ordered state machine for one action selector and policy/capability/directory version |
-| Receipts | Declassified output records returned to local callers |
 | Audit | Hash-chained allow/deny/fail metadata |
+| Query records | Optional immutable metadata for one invocation; never authoritative for correctness |
 | Capabilities | Signed standing-authorization snapshots |
 | Directories | Signed or measured authoritative lookup snapshots |
 
-Operation states:
-
-| State | Meaning |
-|---|---|
-| `reserved` | Operation identity is claimed; no side effect has started |
-| `validated` | Private validations passed and consequential fields are determined |
-| `submitted` | Provider call has started or may have started |
-| `posted` | Provider result and declassified receipt are committed |
-| `failed` | Validation failed before provider submission; no side effect occurred |
-
 Cloud Storage rules:
 
-- Use `ifGenerationMatch=0` for create-if-absent immutable events and receipts.
-- Use `ifGenerationMatch=<generation>` only for optional index CAS updates.
-- Treat `412 Precondition Failed` as a coordination result, not an exceptional path: it
-  means another attempt already owns the operation.
-- The immutable event stream is authoritative. Mutable indexes are caches.
+- Use `ifGenerationMatch=0` for create-if-absent immutable audit/query records.
+- Mutable indexes are caches only.
 - App-seal or MAC every app-owned state record with a runner-state key distinct from the
   proxy credential KEK.
-- Associated data binds record type, object path, action id, operation key, schema version,
-  policy/capability/directory hashes, and predecessor event path/generation/hash when
-  present.
-- Fail closed on missing predecessor, unexpected generation, MAC failure, rollback
-  evidence, or invalid signature.
-- Runner IAM must not have production delete permission for ledger, receipt, or audit
-  prefixes.
+- Associated data binds record type, object path, query id, invocation id, schema version,
+  and capability/directory hashes when present.
+- Fail closed on MAC failure, rollback evidence, unexpected generation, or invalid
+  signature.
+- Runner IAM must not have production delete permission for audit or immutable query
+  record prefixes.
 
 Default object layout:
 
 ```text
 gs://confidant-runner-state/
-  ledger/<action_id>/<op_hash>/events/000_reserved.json.enc
-  ledger/<action_id>/<op_hash>/events/010_validated.json.enc
-  ledger/<action_id>/<op_hash>/events/020_submitted.json.enc
-  ledger/<action_id>/<op_hash>/events/030_posted.json.enc
-  receipts/<receipt_id>.json.enc
   audit/YYYY/MM/DD/<event_id>.json.enc
+  queries/YYYY/MM/DD/<invocation_id>.json.enc
   capabilities/<capability_id>/<version>.json
   directories/<directory_id>/<version>.json
 ```
 
-Cloud Storage is enough for the single-resource idempotency this phase needs: the operation
-key is the obligation, and one create-if-absent write serializes it. It is not a general
-multi-object transaction system. Actions that need multi-resource coordination or hard
-aggregate invariants are deferred (see §17).
-
----
-
-## 11. Idempotency And Reconciliation
-
-The runner operation ledger is the authoritative long-lived duplicate-effect guard.
-Provider idempotency keys are an auxiliary retry aid.
-
-Rules:
-
-- The durable operation key is derived by the runner, not supplied by the caller.
-- Caller idempotency keys are stored and checked for consistency only.
-- Provider idempotency material is minted by the runner and stored before `submitted`.
-- After `submitted`, retries must not mint fresh provider idempotency material.
-- Retry order after `submitted`:
-  1. return the committed receipt if present
-  2. otherwise re-issue the exact stored provider request under the stored provider
-     idempotency key and read the provider's synchronous status
-  3. commit `posted` on success; return a constant denial on a terminal provider failure
-
-Because this phase targets a synchronous, provider-idempotent rail, step 2 resolves every
-crash window in one call. Asynchronous rails that need evidence-based reconciliation or an
-operator queue are deferred (see §17).
+Audit records include query-safe metadata only: query id, invocation id, caller metadata,
+connector ids, safe selector hash or explicitly public selector, status, denial class,
+output schema, output byte count, and timing. They do not include raw private payloads,
+raw connector responses, credentials, auth headers, or token-looking values.
 
 ---
 
 ## 12. Transports And Deployment
 
-Agent-to-runner:
+`confidant-agent` to runner:
 
 - mTLS over tailnet-only ingress
 - no public runner ingress
@@ -560,7 +586,7 @@ Deployment requirements:
 - Proxy is the only component allowed to reach external provider APIs.
 - Proxy measured config includes KMS key, WIF audience, credential module set, egress
   posture, credential policy hashes, delegate policy hashes, and evidence requirements.
-- Runner measured config includes action ids, skill bundle digests, manifest hashes,
+- Runner measured config includes query ids, skill bundle digests, manifest hashes,
   schema hashes, connector roles, output schemas, state bucket, state key, and proxy
   identity pins.
 - Runtime operational config may include timeouts, display names, audit sink, and endpoint
@@ -572,15 +598,14 @@ Deployment requirements:
 
 - **G-R1 No local secrets.** Long-lived credentials and provider auth material never exist
   locally after enrollment.
-- **G-R2 No runner credentials.** The runner never receives plaintext credentials, wallet
-  secrets, OAuth tokens, provider signing keys, or auth headers.
+- **G-R2 No runner credentials.** The runner never receives plaintext credentials,
+  provider signing keys, OAuth tokens, or auth headers.
 - **G-R3 No runner internet egress.** Production runners cannot call public provider APIs
   directly.
 - **G-R4 Measured skill authority.** Only pinned skill digests and manifests can request
-  delegated egress or side effects.
-- **G-R5 Authoritative determination before side effect.** No side effect is submitted
-  until static policy, input schema, private validations, idempotency, and
-  consequential-field derivation pass.
+  delegated read egress.
+- **G-R5 Read-only egress.** V1 connector calls are restricted to declared read methods,
+  hosts, paths, scopes, and proxy delegation policy.
 - **G-R6 Schema declassification.** Outputs are validated against declared schemas and max
   byte sizes before local return.
 - **G-R7 Fail closed.** Missing policy, invalid input, connector failure, attestation
@@ -594,38 +619,32 @@ Deployment requirements:
 ## 14. Invariants
 
 - **I-R1** The local agent never receives connector credentials, raw provider auth
-  material, or private connector responses.
+  material, or raw private connector responses.
 - **I-R2** Runners never receive credentials or provider signing material.
-- **I-R3** Action id selects a measured skill action and manifest; request fields cannot
+- **I-R3** Query id selects a measured skill query and manifest; request fields cannot
   select code, egress, connector scopes, or output policy.
 - **I-R4** Core modules do not import provider SDKs or skill packages.
 - **I-R5** Input schema validation and static authorization complete before proxy egress.
 - **I-R6** Proxy validates credential and delegation policy before unwrap, mint, sign, or
   injection.
-- **I-R7** Side effects happen only through the proxy using declared connector roles,
-  action ids, and egress hosts.
+- **I-R7** Connector calls happen only through the proxy using declared connector roles,
+  query ids, hosts, methods, and paths.
 - **I-R8** Runner network policy blocks direct public egress.
-- **I-R9** Side-effecting requests require idempotency keys, but durable operation identity
-  is runner-derived.
-- **I-R10** Same caller idempotency key with different canonical input is rejected.
-- **I-R11** Receipts are durably committed before success returns.
-- **I-R12** Output validation rejects extra fields and raw provider payloads.
-- **I-R13** Pre-side-effect denials use one constant caller-facing code per action.
-- **I-R14** Audit contains metadata only, never secrets or private payload bodies.
-- **I-R15** Provider policy state or evidence is checked before side effects when declared.
-- **I-R16** Multiple runners coordinate by the runner-derived operation key: the first
-  create-if-absent write wins and every other attempt returns its receipt or a retryable
-  error.
-- **I-R17** `submitted` is appended before provider side effect.
-- **I-R18** After `submitted`, retries return the receipt or an exact stored provider retry;
-  never blind resubmission.
-- **I-R19** Runner durable state is app-sealed/MACed and bound to object path, schema,
-  action, operation, and predecessor evidence.
-- **I-R20** Cloud Storage is not used for hard multi-object aggregate invariants.
-- **I-R21** The runner evaluates no manifest expressions; `authoritative_bindings` and
+- **I-R9** V1 exposes no write, mutate, send, create, update, delete, confirm, execute, or
+  submit connector capability.
+- **I-R10** `QueryContext` exposes only capabilities declared by the selected manifest.
+- **I-R11** Output validation rejects extra fields and raw provider payloads.
+- **I-R12** Private validation denials use one constant caller-facing code per query.
+- **I-R13** Audit contains metadata only, never secrets or private payload bodies.
+- **I-R14** Provider policy state or evidence is checked before connector calls when
+  declared.
+- **I-R15** Runner durable state is app-sealed/MACed where app-owned and bound to object
+  path, schema, query, invocation, and relevant version evidence.
+- **I-R16** The runner evaluates no manifest expressions; `authoritative_bindings` and
   `eligibility` are declarative and enforced by skill code.
-- **I-R22** `sealed_source` reads are local and never traverse the proxy; only `egress`
+- **I-R17** `sealed_source` reads are local and never traverse the proxy; only `egress`
   connectors reach the network.
+- **I-R18** Connector response size and query output size are both bounded.
 
 ---
 
@@ -633,40 +652,43 @@ Deployment requirements:
 
 Core unit tests:
 
-- skill registry rejects unknown action, duplicate action id, missing schema, unpinned skill
+- `confidant-agent query invoke` and `confidant-agent mcp` use the shared runner client,
+  not the transparent proxy/MITM path
+- `confidant-agent mcp` exposes one read-only tool per enabled query and does not expose a
+  generic arbitrary query tool by default
+- public query catalog contains only safe metadata and cannot authorize an invocation
+- skill registry rejects unknown query, duplicate query id, missing schema, unpinned skill
   digest, manifest/schema hash mismatch, and a connector `kind` that is not
   `sealed_source` or `egress`
-- core dependency guard fails if agent, runner, or proxy imports provider SDKs or
-  `confidant-skills/*`
+- registry rejects V1 manifests with side-effect declarations or non-read egress methods
+- core dependency guard fails if agent, runner, or proxy imports provider SDKs or if core
+  packages import `confidant-skills/*`
 - canonicalization stable across JSON order
 - input schema rejects unknown fields and consequential fields not in schema
-- idempotency accepts same key and same canonical input, rejects conflicting input
-- operation key ignores caller idempotency format
-- state machine permits only valid transitions
-- Cloud Storage writers use generation preconditions
-- sealing/MAC fails on path, schema, predecessor, or hash tamper
-- UDS peer credential mapping rejects claimed-principal mismatch
-- proxy delegation rejects wrong runner, action, role, method, path, host, or evidence
-  before credential unwrap
+- manifest authorization rejects undeclared connector id, role, host, method, path, scope,
+  response limit, or output schema
 - output validation rejects raw provider response, extra fields, oversize output, and
   binary blobs
-- redaction removes auth headers, connector response bodies, wallet secrets, JWTs, and
-  token-looking values from errors and logs
+- redaction removes auth headers, connector response bodies, JWTs, and token-looking values
+  from errors and logs
 
 Core integration/security tests:
 
-- fake skill happy path through fake proxy returns only schema output
-- disabling a pinned skill removes its action without changing core code
+- Codex can call a Confidant query through MCP from a natural-language prompt and receives
+  only the declassified schema output
+- GitHub repo security demo path can be invoked through MCP from "check my private repo
+  security posture" and returns counts/prioritized findings without raw alert payloads,
+  secret values, source snippets, credentials, or auth headers
+- fake read skill happy path through fake proxy returns only schema output
+- disabling a pinned skill removes its query without changing core code
 - invalid input/static denial never calls proxy
 - undelegated runner context never unwraps credentials
-- runner direct public egress test action fails before network connection
+- runner direct public egress test query fails before network connection
 - `sealed_source` reads open no network socket; only `egress` connectors reach the proxy
-- 50 concurrent identical requests produce one provider call and one receipt
-- concurrent conflicting idempotency rejects all but first committed input
-- injected crashes before and after the provider call never cause blind resubmission
-- crash after `submitted` re-issues the exact stored request under the stored provider key
-  and commits `posted` from the provider's synchronous status, with no second side effect
-- state tamper/rollback fails closed
+- private validation denials are caller-indistinguishable where configured
+- connector response over max bytes fails closed and returns no partial private data
+- output schema failure audits and returns no partial private data
+- state tamper/rollback fails closed for app-owned audit/query records
 - audit chain verifies over mixed allow, deny, and fail records
 - production IAM denies delete on immutable runner-state prefixes
 
@@ -676,61 +698,61 @@ Validation before production:
 - attestation policy pinned separately for runner and proxy image/config
 - skill manifest report for every enabled bundle: digest, schema hashes, test report,
   review record
-- core dependency audit verifies no provider SDK imports or skill-package imports
+- core dependency audit verifies no provider SDK imports or skill-package imports in core
 - runner/proxy identity pins verified
 - UDS ownership, directory mode, socket mode, and peer credentials verified
 - runner state bucket, KMS key, IAM, retention, and no-delete policy verified
 - no direct runner public egress; proxy-only provider egress
 - end-to-end no-leak scan across local response, agent logs, runner logs, proxy logs,
-  receipts, and audit
-- disaster test for provider success plus receipt-write failure
+  query records, and audit
 
 ---
 
 ## 16. Skill Author Checklist
 
-A new trusted skill must provide:
+A new trusted read skill must provide:
 
-- `SPEC.md` with action contract, threat model delta, manifest, invariants, tests, and
+- `SPEC.md` with query contract, threat model delta, manifest, invariants, tests, and
   operational runbook
 - input and output schemas
-- canonical operation-key components
 - connector role declarations
 - egress host/method/path declarations
-- side-effect declaration and caps
+- response-size and output-size limits
 - provider-policy evidence requirements, if any
 - declassification schema and residual leak statement
 - fake connector test fixtures
-- replay, race, and crash tests
 - no-leak tests for private context and provider responses
 - manifest digest and reproducible build instructions
 
 ---
 
-## 17. Deferred (Later Iterations)
+## 17. Deferred
 
-This phase is intentionally scoped to a single-resource, synchronous, provider-idempotent
-side effect. The machinery below is designed for but not built until an action needs it.
-Each addition is additive: it changes neither the agent contract, the measured-skill model,
-the proxy boundary, nor the declassification rules.
+The machinery below is intentionally not part of V1.
 
-| Deferred | Add it when an action needs | Why it is not on the critical path now |
+| Deferred | Add it when a use case needs | Why it is not in V1 |
 |---|---|---|
-| Multi-resource lease-locks | to hold more than one resource at once | one obligation per action means the operation key already serializes it |
-| Standalone effect ledger | a duplicate-effect guard independent of the operation key | the operation key is the obligation for this phase |
-| Evidence-based reconciliation + operator queue | an asynchronous rail a synchronous retry cannot prove | the demo rail is synchronous and provider-idempotent |
-| Cumulative / aggregate caps | any non-fake deployment | needs a transactional state layer or one conservative aggregate effect key |
-| Separately-loadable skill bundles | to add or measure skills without rebuilding the runner image | v1 compiles skills in and measures the whole image |
-
-Real lease-locks need lease expiry and a fencing token, not a bare Cloud Storage object —
-which is exactly why they are deferred rather than approximated here.
+| Side-effecting actions | payments, refunds, sends, creates, updates, deletes, trades, remediations | requires operation identity, idempotency, crash recovery, and reconciliation |
+| Durable operation ledger | duplicate-effect prevention | no V1 side effects |
+| Caller idempotency index | same idempotency key with different mutation input must be rejected | no V1 mutations |
+| Multi-resource lease-locks | more than one mutable resource at once | no V1 mutations |
+| Standalone effect ledger | duplicate-effect guard independent of operation key | no V1 effects |
+| Evidence-based reconciliation + operator queue | asynchronous rails or jobs | no V1 async effects |
+| Cumulative / aggregate caps | non-fake payment or spend workflows | no V1 spend |
+| Read-only `POST`/GraphQL/search | APIs that encode reads as request bodies | needs endpoint-level read semantics and stricter request/output controls |
+| Separately-loadable skill bundles | adding skills without rebuilding the runner image | V1 compiles skills into one measured image |
+| WASM skills | stronger runtime isolation for skill code | compile-time Go skills are simpler for V1 |
 
 ---
 
-## Open Questions
+## Resolved For First Demo
 
-- Whether the core should later support WASM skills. If so, the same measured digest,
-  host-services-only, no-provider-in-core rule applies.
-- Whether some skill classes need a transactional state backend for aggregate invariants
-  (see §17).
-
+- The first V1 read-only demo skill is `github.repo_security_brief.v1`.
+- The demo uses fixed GitHub REST read endpoints for repository Dependabot alerts, code
+  scanning alerts, and secret scanning alerts.
+- The caller may supply only a repository selector. The runner validates the selector
+  against configured repository authorization before GitHub egress.
+- The local output is a bounded posture brief: coverage status, aggregate counts, risk
+  level, and the top prioritized remediation items.
+- Secret values, source snippets, raw alert payloads, credentials, and auth headers are
+  never declassified.

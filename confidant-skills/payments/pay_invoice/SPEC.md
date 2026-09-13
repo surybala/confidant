@@ -1,10 +1,14 @@
 # Confidant Skill - Pay Invoice (Stripe test mode)
 
-**Status:** Draft v1 for Stripe test-mode demo  
-**Version:** 0.2  
-**Date:** 2026-09-12  
+**Status:** Deferred side-effect skill design - not part of read-only runner V1
+**Version:** 0.3
+**Date:** 2026-09-13
 **Core dependency:** [Phase 2 Core Runner](../../../docs/phase2-runner-core.md)  
 **Action id:** `payments.pay_invoice.v1`
+
+> This file is preserved as the first payment skill design. It is intentionally deferred
+> until after the Phase 2 read-only runner is implemented. Within this document, "v1"
+> refers to the first version of the future payment skill, not the runner V1 scope.
 
 This trusted skill settles a pre-approved invoice through a synchronous payment API. The v1
 demo uses **Stripe in test mode**. It lives under `confidant-skills` because invoice

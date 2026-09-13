@@ -12,9 +12,11 @@ all: build
 build: build-proxy build-agent
 
 build-proxy:
+	mkdir -p $(BIN)
 	cd proxy && go build -o ../$(BIN)/confidant-proxy .
 
 build-agent:
+	mkdir -p $(BIN)
 	cd agent && go build -o ../$(BIN)/confidant-agent .
 
 # The proxy needs a store + dev KEK to serve. Create one first, e.g.:
