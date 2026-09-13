@@ -109,9 +109,9 @@ Out of scope for this v1 demo:
     ]
   },
   "connectors": [
-    { "id": "fixture-invoices/demo", "role": "invoice_source", "scopes": ["invoice.read"] },
-    { "id": "fixture-vendor-directory/demo", "role": "vendor_source", "scopes": ["vendor.read"] },
-    { "id": "stripe/test", "role": "payment_rail", "scopes": ["payment.create"] }
+    { "id": "fixture-invoices/demo", "kind": "sealed_source", "role": "invoice_source", "scopes": ["invoice.read"] },
+    { "id": "fixture-vendor-directory/demo", "kind": "sealed_source", "role": "vendor_source", "scopes": ["vendor.read"] },
+    { "id": "stripe/test", "kind": "egress", "role": "payment_rail", "scopes": ["payment.create"] }
   ],
   "egress": {
     "allow_hosts": ["api.stripe.com"],
@@ -138,6 +138,17 @@ Out of scope for this v1 demo:
   }
 }
 ```
+
+Interface notes (resolve the core spec's four boundary decisions for this skill):
+
+- `fixture-invoices/demo` and `fixture-vendor-directory/demo` are `sealed_source`
+  connectors: measured with the skill and read locally through `ActionContext`. Only
+  `stripe/test` is `egress` and is brokered by the proxy.
+- `PayInvoiceSelector` and `PayInvoiceReceipt` are Go structs; input is decoded with
+  unknown-field rejection, and a canonical schema hash is pinned in the measured allowlist.
+- `authoritative_bindings` and `eligibility` are declarative and human-reviewed. This
+  skill's `Plan`/`Execute` code enforces them (I-PAY2..I-PAY7); the runner evaluates no
+  expressions.
 
 ---
 
@@ -232,6 +243,8 @@ Demo vendor directory fixture:
 Fixture rules:
 
 - Fixtures are measured with the skill or signed and verified before use.
+- Fixtures are `sealed_source` connectors: read locally through `ActionContext`, never via
+  the proxy.
 - The vendor directory is the fund-routing root of trust; the caller can never supply
   `destination_ref`.
 - No action path may mutate the invoice fixtures or the vendor directory.

@@ -136,7 +136,7 @@ LOCAL MACHINE (untrusted)                 GCP CONFIDENTIAL SPACE (trusted)
 | `confidant-agent` | Local | Authenticates to runner, forwards action calls, returns declassified outputs | No | No |
 | `confidant-runner` | Enclave | Minimal trusted-skill host; validates action envelopes; provides state, audit, connector calls, and output validation | Yes | No |
 | `confidant-proxy` | Enclave | Minimal credentialed egress broker; unwraps/mints/signs/injects credentials; enforces declarative credential and delegation policy | Provider responses in transit | Yes, ephemeral |
-| `confidant-skills` bundles | Runner image or measured bundle set | Trusted recipes with provider schemas, connector adapters, business logic, policy templates, and tests | Yes | No |
+| `confidant-skills` bundles | Compiled into the runner image (build-time registry) | Trusted recipes with provider schemas, connector adapters, business logic, policy templates, and tests | Yes | No |
 | Runner state bucket | Cloud Storage | Operation logs, receipts, capability snapshots, directory snapshots, audit | Metadata and declassified receipts; app-sealed/MACed | No |
 | Credential store | Proxy-controlled | Sealed credentials plus credential/delegation policy | Policy metadata | Ciphertext at rest |
 
@@ -164,7 +164,7 @@ request shaping.
 - static manifest authorization
 - durable operation keys, receipts, and audit
 - state record sealing/MAC verification
-- proxy-backed connector invocation
+- sealed-source reads and proxy-backed egress connector invocation
 - output schema validation and max-byte enforcement
 - panic hygiene, constant denial, and declassification boundary
 
@@ -214,8 +214,8 @@ digest:
     "eligibility": ["record.exists", "record.status == 'approved'"]
   },
   "connectors": [
-    { "id": "authoritative-system/prod", "role": "source", "scopes": ["read"] },
-    { "id": "effect-rail/prod", "role": "effect", "scopes": ["mutate"] }
+    { "id": "authoritative-system/prod", "kind": "egress", "role": "source", "scopes": ["read"] },
+    { "id": "effect-rail/prod", "kind": "egress", "role": "effect", "scopes": ["mutate"] }
   ],
   "egress": {
     "allow_hosts": ["api.example.com"],
@@ -242,6 +242,11 @@ skill digest are part of the runner measured allowlist. A caller can select only
 id. It cannot choose code, a skill bundle, connector scope, egress host, output policy, or
 declassification mode.
 
+Each connector declares a `kind`: `sealed_source` (measured fixtures or signed
+directory/capability snapshots, read locally through `ActionContext`) or `egress` (a
+credentialed call brokered by the proxy). Only `egress` connectors carry an egress host,
+and only they reach the network.
+
 ### Skill Interface
 
 Each skill action implements the runner host interface:
@@ -259,7 +264,9 @@ type Action interface {
 
 `ActionContext` is a capability object, not a general runtime. It exposes only:
 
-- declared connector calls through the proxy-backed connector interface
+- declared egress connector calls through the proxy-backed connector interface
+- declared sealed-source reads (measured fixtures and signed directory/capability
+  snapshots) — local, never egress
 - durable operation/event APIs
 - receipt write/read APIs
 - audit APIs
@@ -283,6 +290,20 @@ If an action needs arbitrary caller-provided recipient, amount, target, or code,
 registered. There is no "offer it with a confirmation" path in Phase 2. Actions that need
 multi-resource locks, a standalone effect ledger, or asynchronous reconciliation are
 deferred (see §17).
+
+### Schemas, Bindings, And Loading
+
+- **Schemas.** `input_schema` and `output_schema` name Go structs. Input is decoded with
+  unknown-field rejection; output is built only from declared receipt fields. A canonical
+  hash of each schema is pinned in the measured allowlist, so any schema change changes the
+  measurement. The core ships no dynamic schema language.
+- **Bindings are declarative.** `authoritative_bindings` and `eligibility` are measured,
+  human-reviewed statements of what the skill must prove. The runner does not evaluate them
+  and ships no expression engine; the skill's `Plan`/`Execute` code enforces them.
+- **Loading (v1).** Skills are compiled into the runner image and registered at build time.
+  `skill_digest` is the hash of the skill package plus its embedded sealed sources. Enabling
+  or disabling an action is a runner config flag over the registry, not a core code change.
+  Separately-loadable measured bundles are deferred (see §17).
 
 ---
 
@@ -601,6 +622,10 @@ Deployment requirements:
 - **I-R19** Runner durable state is app-sealed/MACed and bound to object path, schema,
   action, operation, and predecessor evidence.
 - **I-R20** Cloud Storage is not used for hard multi-object aggregate invariants.
+- **I-R21** The runner evaluates no manifest expressions; `authoritative_bindings` and
+  `eligibility` are declarative and enforced by skill code.
+- **I-R22** `sealed_source` reads are local and never traverse the proxy; only `egress`
+  connectors reach the network.
 
 ---
 
@@ -609,7 +634,8 @@ Deployment requirements:
 Core unit tests:
 
 - skill registry rejects unknown action, duplicate action id, missing schema, unpinned skill
-  digest, and manifest/schema hash mismatch
+  digest, manifest/schema hash mismatch, and a connector `kind` that is not
+  `sealed_source` or `egress`
 - core dependency guard fails if agent, runner, or proxy imports provider SDKs or
   `confidant-skills/*`
 - canonicalization stable across JSON order
@@ -634,6 +660,7 @@ Core integration/security tests:
 - invalid input/static denial never calls proxy
 - undelegated runner context never unwraps credentials
 - runner direct public egress test action fails before network connection
+- `sealed_source` reads open no network socket; only `egress` connectors reach the proxy
 - 50 concurrent identical requests produce one provider call and one receipt
 - concurrent conflicting idempotency rejects all but first committed input
 - injected crashes before and after the provider call never cause blind resubmission
@@ -693,6 +720,7 @@ the proxy boundary, nor the declassification rules.
 | Standalone effect ledger | a duplicate-effect guard independent of the operation key | the operation key is the obligation for this phase |
 | Evidence-based reconciliation + operator queue | an asynchronous rail a synchronous retry cannot prove | the demo rail is synchronous and provider-idempotent |
 | Cumulative / aggregate caps | any non-fake deployment | needs a transactional state layer or one conservative aggregate effect key |
+| Separately-loadable skill bundles | to add or measure skills without rebuilding the runner image | v1 compiles skills in and measures the whole image |
 
 Real lease-locks need lease expiry and a fencing token, not a bare Cloud Storage object —
 which is exactly why they are deferred rather than approximated here.
